@@ -1,0 +1,6 @@
+# Dependencies for running on the Pi: lego_pi/relay_server.py (FastAPI +
+# uvicorn) and lego_control/hub_controller.py (pylgbst + bleak), since
+# both packages get deployed together and run in the same interpreter.
+fastapi
+uvicorn
+pylgbst[bleak]

@@ -1,0 +1,38 @@
+[Unit]
+Description=LegoBot relay server (thin body, no brains)
+After=bluetooth.target bluetooth.service network-online.target
+Wants=bluetooth.target network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/legobot
+# systemd-rfkill persists rfkill state across reboots (in
+# /var/lib/systemd/rfkill/) -- if Bluetooth was ever soft-blocked on
+# this Pi, it comes back soft-blocked on every future boot too. Rather
+# than relying on someone remembering to run `rfkill unblock bluetooth`
+# by hand after every reboot, do it here so the relay always starts
+# with a usable radio. Harmless no-op if it's already unblocked.
+ExecStartPre=/usr/sbin/rfkill unblock bluetooth
+# Belt-and-suspenders alongside the retry loop in relay_server.py: nudge
+# BlueZ to actually power the adapter on, in case bluetoothd hasn't done
+# so yet by the time we start (a plain "After=bluetooth.service" only
+# guarantees the daemon has started, not that it's finished registering
+# hci0 over D-Bus). The leading "-" means a failure here doesn't stop
+# the unit from starting -- the connect retry loop handles it either way.
+ExecStartPre=-/usr/bin/bluetoothctl power on
+# Under systemd, stdout is a pipe to journald, not a real tty -- Python
+# defaults to fully block-buffered output in that case (vs. line-buffered
+# on an interactive terminal). Uvicorn's own log lines get flushed
+# explicitly by its logging setup, but the plain print() calls in
+# hub_controller's discovery-scan loop don't, so they can sit invisible
+# in the buffer for a long time even though the scan is actively running.
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m lego_pi
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
