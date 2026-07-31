@@ -29,6 +29,7 @@ import argparse
 import sys
 from pathlib import Path
 
+
 _SRC_DIR = Path(__file__).parent / "src"
 _SCRIPTS_DIR = Path(__file__).parent / "scripts"
 sys.path.insert(0, str(_SRC_DIR))
@@ -37,7 +38,7 @@ sys.path.insert(0, str(_SCRIPTS_DIR))
 
 def _run_deploy():
     print("== Deploying src/lego_pi + src/lego_control to the Pi ==")
-    from deploy import main as deploy_main
+    from scripts.deploy import main as deploy_main
     deploy_main()
     print()
 
@@ -60,7 +61,7 @@ def _report_health() -> bool:
 
 
 def _interactive_session():
-    from pc_test_client import main as test_main
+    from scripts.pc_test_client import main as test_main
     test_main()
 
 
