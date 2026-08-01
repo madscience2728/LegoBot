@@ -97,6 +97,14 @@ def main():
         parser.error("a command is required unless using --health, --frame, or --audio")
 
     body = {"cmd": args.cmd, "args": _parse_args(args.kv)}
+    # "hub" is reserved -- a request-routing field (relay_server.py's
+    # Command.hub), not a command argument. If it showed up in the
+    # key=value pairs, pull it out of args and up to the body's top
+    # level instead of leaving it there to get splatted as **kwargs
+    # into set_speed()/goto_angle()/etc, which don't have a hub
+    # parameter and would reject it with a TypeError.
+    if "hub" in body["args"]:
+        body["hub"] = body["args"].pop("hub")
     r = requests.post(f"{SERVER}/command", json=body, timeout=20)
     print(r.status_code, r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text)
 

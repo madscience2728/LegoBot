@@ -8,6 +8,11 @@ Bluetooth radio. Both paths ultimately run the exact same
 hub_controller code (see lego_control/hub_controller.py) -- this module
 only decides WHICH machine's radio does the talking.
 
+TWO HUBS: this robot has a front hub and a rear hub (see
+lego_pi/relay_server.py). Every public function here takes a
+hub="front"|"rear" parameter, defaulting to "front" for backward
+compatibility with existing callers.
+
 Routing rule (Pi-first, ~99% of use, direct BLE as the rare exception):
     1. Retry the Pi relay's /health for a few seconds -- covers the
        normal "just restarted the service" case, not just a genuinely
@@ -21,6 +26,17 @@ Routing rule (Pi-first, ~99% of use, direct BLE as the rare exception):
        so it can quietly switch back to the Pi once it's reachable
        again, without needing to be told.
 
+A 409 from the Pi relay is NOT automatically treated as "connectivity
+problem, fall back to direct BLE" -- see _send()'s handling. Only "hub
+hasn't finished connecting yet" 409s get the wait-then-retry-then-
+fallback treatment. A 409 for a genuinely different reason (e.g. no
+motor attached on the requested port -- a real HubNotReady, not a
+transient one) gets surfaced straight to the caller instead. Falling
+back to direct BLE for that kind of error doesn't help (retrying the
+same wrong port fails there too), and for a non-front hub it would
+silently try to connect to the WRONG physical hub, since the direct-BLE
+fallback below only knows how to reach one hub (see _local()).
+
 Caveat: BLE supports one active central connection to the hub at a time.
 If you're in direct-BLE mode, the PC currently holds that connection --
 the Pi relay can't steal it back mid-session, it'll just keep scanning
@@ -30,7 +46,9 @@ release_direct_ble()).
 Env vars (same idea as SpiderBot's SPIDER_BOT_HOST):
     LEGOBOT_PI_HOST           -- Pi's hostname or IP, e.g. "legobot.local"
     LEGOBOT_PI_PORT           -- default 8000
-    LEGOBOT_HUB_NAME          -- default "Control+ Hub"
+    LEGOBOT_HUB_NAME          -- default "Control+ Hub" -- direct-BLE
+                                 fallback target, front hub only (see
+                                 _local())
     LEGOBOT_PI_WAIT_ATTEMPTS  -- default 6 (health-check retries before giving up on the Pi)
     LEGOBOT_PI_WAIT_DELAY     -- default 1.5 (seconds between those retries)
 """
@@ -41,7 +59,7 @@ import time
 
 import requests
 
-from lego_control.hub_controller import HubController, dispatch
+from lego_control.hub_controller import HubController, dispatch as _hub_dispatch
 
 PI_PORT = int(os.environ.get("LEGOBOT_PI_PORT", "8000"))
 HUB_NAME = os.environ.get("LEGOBOT_HUB_NAME", "Control+ Hub")
@@ -103,35 +121,55 @@ def _wait_for_pi(base_url: str, attempts: int = PI_WAIT_ATTEMPTS, delay: float =
 
 
 def _wait_for_pi_connected(
-    base_url: str, attempts: int = PI_CONNECT_WAIT_ATTEMPTS, delay: float = PI_CONNECT_WAIT_DELAY
+    base_url: str, hub: str,
+    attempts: int = PI_CONNECT_WAIT_ATTEMPTS, delay: float = PI_CONNECT_WAIT_DELAY,
 ) -> bool:
-    """Waits for the Pi's *own* BLE connection to the hub to finish, as
-    opposed to _wait_for_pi which only waits for the relay process to
-    answer HTTP at all. These are genuinely different conditions: the
-    relay can be fully up and responding (health check passes instantly)
-    while its background discovery thread is still a few scan passes
-    away from actually connecting to the hub (see relay_server.py's
-    startup -- that connect runs on its own thread precisely so /health
-    doesn't block on it). A 409 from /command means exactly this state.
+    """Waits for the Pi's *own* BLE connection to the specified hub to
+    finish, as opposed to _wait_for_pi which only waits for the relay
+    process to answer HTTP at all. These are genuinely different
+    conditions: the relay can be fully up and responding (health check
+    passes instantly) while its background discovery thread is still a
+    few scan passes away from actually connecting to a hub (see
+    relay_server.py's startup -- that connect runs on its own thread
+    precisely so /health doesn't block on it). A "still connecting" 409
+    from /command means exactly this state.
 
     Waiting here instead of bypassing matters: bypassing to direct BLE
     the moment the Pi hasn't connected yet would have the PC grab the
     one BLE slot the Pi's thread is actively trying to acquire, which
     would strand the Pi permanently rather than just being slow.
+
+    Checks result[hub]["connected"] -- /health reports per-hub status
+    (relay_server.py connects a front AND a rear hub). Which hub to
+    check is the caller's command's own hub, not always "front".
     """
     for attempt in range(1, attempts + 1):
         result = _pi_health_once(base_url)
-        if result is not None and result.get("connected"):
+        if result is not None and result.get(hub, {}).get("connected"):
             return True
         if attempt < attempts:
             time.sleep(delay)
     return False
 
 
-def _local() -> HubController:
+def _local(hub: str = "front") -> HubController:
     """Lazily connect a local (PC) BLE controller -- only touched once
     direct-BLE mode is actually chosen, so a healthy Pi setup never has
-    the PC's own Bluetooth radio scanning at all."""
+    the PC's own Bluetooth radio scanning at all.
+
+    Only supports the front hub. There's no PC-side fallback for the
+    rear hub yet -- rather than silently connecting to the WRONG
+    physical hub (front) for a command meant for "rear", this raises
+    clearly so the real problem (rear hub down on the Pi) gets fixed at
+    the source instead of masked by a fallback that's quietly talking
+    to the wrong device."""
+    if hub != "front":
+        raise RuntimeError(
+            f"direct-BLE fallback isn't supported for the {hub!r} hub -- "
+            f"only the front hub (LEGOBOT_HUB_NAME) has a PC-side fallback. "
+            f"Fix the Pi relay's connection to the {hub!r} hub instead of "
+            f"relying on a fallback here."
+        )
     global _local_controller
     with _local_lock:
         if _local_controller is None:
@@ -229,49 +267,64 @@ def release_direct_ble() -> None:
     _route_mode = None
 
 
-def _send(cmd: str, args: dict, timeout: float = 15.0) -> dict:
+def _send(cmd: str, args: dict, hub: str = "front", timeout: float = 15.0) -> dict:
     route = _resolve_route()
 
     if route == "pi":
         base_url = _pi_base_url()
+        payload = {"cmd": cmd, "args": args, "hub": hub}
         try:
-            r = requests.post(
-                f"{base_url}/command", json={"cmd": cmd, "args": args}, timeout=timeout
-            )
-
+            r = requests.post(f"{base_url}/command", json=payload, timeout=timeout)
+        except requests.RequestException as e:
+            print(f"[robot_client] Pi relay call failed mid-flight ({e}), "
+                  f"falling back to direct BLE for this command.")
+            route = "direct"
+        else:
             if r.status_code == 409:
-                # Relay is up and reachable, just hasn't finished
-                # connecting to the hub itself yet -- wait for that,
-                # don't bypass. Bypassing here would have the PC grab
-                # the one BLE slot the Pi's background thread is
-                # actively trying to acquire, permanently stranding it
-                # instead of just being early.
-                print(
-                    "[robot_client] Pi relay hasn't connected to the hub yet -- "
-                    "waiting rather than grabbing BLE out from under it."
-                )
-                if _wait_for_pi_connected(base_url):
-                    r = requests.post(
-                        f"{base_url}/command", json={"cmd": cmd, "args": args}, timeout=timeout
-                    )
-                else:
+                detail = ""
+                try:
+                    detail = r.json().get("detail", "")
+                except ValueError:
+                    pass
+
+                if "is not connected" in detail:
+                    # Genuinely still connecting -- wait, don't bypass.
                     print(
-                        "[robot_client] Pi still hasn't connected after waiting -- "
-                        "falling back to direct BLE for this command."
+                        f"[robot_client] {hub} hub hasn't connected yet -- "
+                        "waiting rather than grabbing BLE out from under it."
                     )
-                    route = "direct"
+                    if _wait_for_pi_connected(base_url, hub):
+                        try:
+                            r = requests.post(f"{base_url}/command", json=payload, timeout=timeout)
+                        except requests.RequestException as e:
+                            print(f"[robot_client] Pi relay call failed mid-flight ({e}), "
+                                  f"falling back to direct BLE for this command.")
+                            route = "direct"
+                    else:
+                        print(
+                            f"[robot_client] {hub} hub still hasn't connected after waiting -- "
+                            "falling back to direct BLE for this command."
+                        )
+                        route = "direct"
+                else:
+                    # Deterministic application error (e.g. "no motor
+                    # attached on port X", unknown hub) -- not a
+                    # connectivity problem. Falling back to direct BLE
+                    # here would either hit the exact same error again
+                    # or, for a non-front hub, silently try to talk to
+                    # the WRONG physical hub. Surface it to the caller
+                    # instead -- this raises straight out of _send(),
+                    # deliberately NOT caught by the RequestException
+                    # handler above (this isn't a network failure).
+                    r.raise_for_status()
 
             if route == "pi":
                 r.raise_for_status()
                 result = r.json()
                 result["_route"] = "pi_relay"
                 return result
-        except requests.RequestException as e:
-            print(f"[robot_client] Pi relay call failed mid-flight ({e}), "
-                  f"falling back to direct BLE for this command.")
-            route = "direct"
 
-    result = dispatch(_local(), cmd, args)
+    result = _hub_dispatch(_local(hub), cmd, args)
     result["_route"] = "direct_ble"
     return result
 
@@ -295,28 +348,29 @@ def health() -> dict:
     return result
 
 
-def stop(port: str = "A") -> dict:
-    return _send("stop", {"port": port})
+def stop(port: str = "A", hub: str = "front") -> dict:
+    return _send("stop", {"port": port}, hub=hub)
 
 
-def set_speed(port: str, speed: float) -> dict:
-    return _send("set_speed", {"port": port, "speed": speed})
+def set_speed(port: str, speed: float, hub: str = "front") -> dict:
+    return _send("set_speed", {"port": port, "speed": speed}, hub=hub)
 
 
-def read_angle(port: str = "A") -> dict:
-    return _send("read_angle", {"port": port})
+def read_angle(port: str = "A", hub: str = "front") -> dict:
+    return _send("read_angle", {"port": port}, hub=hub)
 
 
-def goto_angle(port: str, target_degrees: float, **kwargs) -> dict:
-    return _send("goto_angle", {"port": port, "target_degrees": target_degrees, **kwargs})
+def goto_angle(port: str, target_degrees: float, hub: str = "front", **kwargs) -> dict:
+    return _send("goto_angle", {"port": port, "target_degrees": target_degrees, **kwargs}, hub=hub)
 
 
 # Generic dispatch, mirroring hub_controller.COMMANDS/dispatch() 1:1 --
 # same reasoning as that module's own comment: adding a command means
 # adding one function above and one line here, nowhere else. Exists so
 # callers that receive a command as data (e.g. pc_server.py's /command
-# endpoint, taking {"cmd": ..., "args": ...} off the wire) have a single
-# entrypoint instead of hand-rolling an if/elif per command name.
+# endpoint, taking {"cmd": ..., "args": ..., "hub": ...} off the wire)
+# have a single entrypoint instead of hand-rolling an if/elif per
+# command name.
 COMMANDS = {
     "stop": stop,
     "set_speed": set_speed,
@@ -325,7 +379,7 @@ COMMANDS = {
 }
 
 
-def dispatch(cmd: str, args: dict) -> dict:
+def dispatch(cmd: str, args: dict, hub: str = "front") -> dict:
     if cmd not in COMMANDS:
         raise ValueError(f"unknown command {cmd!r}, expected one of {list(COMMANDS)}")
-    return COMMANDS[cmd](**args)
+    return COMMANDS[cmd](hub=hub, **args)

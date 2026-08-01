@@ -53,6 +53,7 @@ media_client = MediaClient(f"ws://{PI_HOST}:{PI_MEDIA_PORT}/media")
 class Command(BaseModel):
     cmd: str
     args: dict = {}
+    hub: str = "front"  # "front" or "rear" -- see relay_server.py's Command
 
 
 @asynccontextmanager
@@ -81,7 +82,7 @@ def health():
 def command(body: Command):
     """Blocking on purpose -- see module docstring."""
     try:
-        return robot_client.dispatch(body.cmd, body.args)
+        return robot_client.dispatch(body.cmd, body.args, hub=body.hub)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
