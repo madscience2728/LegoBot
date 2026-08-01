@@ -7,7 +7,13 @@ fastapi
 uvicorn
 pylgbst[bleak]
 
-# media_relay.py -- camera + mic capture
+# media_relay.py -- camera + mic capture, and the WebSocket library
+# uvicorn needs to actually SERVE its /media endpoint. `pip install
+# uvicorn` alone does NOT include WebSocket support -- without this,
+# uvicorn 404s every WebSocket handshake with "No supported WebSocket
+# library detected" instead of upgrading the connection, which looks
+# like a media_relay.py bug but is really just a missing dependency.
 opencv-python-headless
 sounddevice
 numpy
+websockets

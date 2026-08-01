@@ -74,14 +74,26 @@ class MediaSource:
 
     def start(self):
         self._video_thread.start()
-        self._audio_stream = sd.InputStream(
-            samplerate=AUDIO_SAMPLE_RATE,
-            channels=1,
-            dtype="int16",
-            blocksize=AUDIO_FRAME_SAMPLES,
-            callback=self._audio_callback,
-        )
-        self._audio_stream.start()
+        try:
+            self._audio_stream = sd.InputStream(
+                samplerate=AUDIO_SAMPLE_RATE,
+                channels=1,
+                dtype="int16",
+                blocksize=AUDIO_FRAME_SAMPLES,
+                callback=self._audio_callback,
+            )
+            self._audio_stream.start()
+        except Exception:
+            # The video thread above is ALREADY running by this point --
+            # if we just let this exception propagate, nothing ever
+            # tells that thread to stop (self._stop never gets set,
+            # nobody calls stop()). It keeps running forever, holding
+            # /dev/video0 open, and the NEXT connection attempt's camera
+            # open then fails too -- one leaked thread per failed
+            # attempt, compounding. Clean up what we already started
+            # before re-raising, so a failed start() doesn't leak.
+            self.stop()
+            raise
 
     def stop(self):
         self._stop.set()
@@ -127,13 +139,29 @@ async def media_ws(websocket: WebSocket):
     loop = asyncio.get_event_loop()
     queue: asyncio.Queue = asyncio.Queue(maxsize=256)
     source = MediaSource(loop, queue)
-    source.start()
-    print("[media_relay] client connected, capture started.")
     try:
+        # Inside the try now, not before it -- a failed start() (camera
+        # or mic busy/unavailable) used to skip the finally entirely,
+        # which is the actual leak this whole fix is for. Now any
+        # failure here still reaches finally: source.stop() below.
+        source.start()
+        print("[media_relay] client connected, capture started.")
         while True:
             packed = await queue.get()
             await websocket.send_bytes(packed)
     except WebSocketDisconnect:
         print("[media_relay] client disconnected.")
+    except Exception as e:
+        # Covers source.start() failing (device busy/unavailable) as
+        # well as anything going wrong mid-stream. Close with a real
+        # code/reason instead of letting the exception propagate up
+        # through ASGI and kill the connection with no close frame at
+        # all -- which is indistinguishable, from the client's side,
+        # from the server just vanishing.
+        print(f"[media_relay] error ({e}), closing connection.")
+        try:
+            await websocket.close(code=1011, reason=str(e)[:120])
+        except Exception:
+            pass
     finally:
         source.stop()

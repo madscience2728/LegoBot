@@ -12,22 +12,13 @@ both to disk so you can verify the pipeline BEFORE wiring it into Gemma:
                                      clipped at the start or end before
                                      you trust the segmenter with Gemma.
 
-This is also where the "trim dead air without losing speech" logic
-lives -- deliberately on the PC, not the Pi (see media_relay.py's
-docstring for why). Two things do the actual work:
-
-  - PRE-ROLL ring buffer: the last ~300ms of audio is always kept even
-    while nothing is triggering yet. When voice IS detected, that
-    buffer is prepended to the segment -- so the first syllable, which
-    happens before webrtcvad has seen enough consecutive voiced frames
-    to confirm "yes, that's speech", doesn't get lost.
-  - HANGOVER: after voice stops, the segment stays open for ~600ms of
-    continued silence before being closed out. A normal pause between
-    sentences is shorter than that, so a person trailing off mid-
-    thought doesn't get cut short.
+The actual demux + VAD segmenting logic lives in
+lego_brain/media_client.py now, shared with lego_brain/pc_server.py --
+this file is just the disk-writing debug wrapper around it. See that
+module's docstring for the pre-roll/hangover reasoning.
 
 Usage:
-    pip install websockets opencv-python-headless numpy webrtcvad
+    pip install -r ../src/lego_brain/requirements.txt opencv-python-headless
     set LEGOBOT_PI_HOST=legobot.local   (or export on mac/linux)
     python3 scripts/pc_media_client.py            # save-to-disk mode
     python3 scripts/pc_media_client.py --preview  # also pop a live cv2 window
@@ -36,86 +27,17 @@ Usage:
 import argparse
 import asyncio
 import os
-import struct
+import sys
 import time
-import wave
-from collections import deque
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
 import numpy as np
-import webrtcvad
-import websockets
 
-TYPE_VIDEO = 0x01
-TYPE_AUDIO = 0x02
-
-AUDIO_SAMPLE_RATE = 16000
-AUDIO_FRAME_MS = 30
-AUDIO_FRAME_BYTES = int(AUDIO_SAMPLE_RATE * AUDIO_FRAME_MS / 1000) * 2  # int16
-
-PREROLL_FRAMES = 10   # ~300ms kept before a trigger, in case speech starts there
-HANGOVER_FRAMES = 20  # ~600ms of continued silence tolerated before closing out
-VAD_AGGRESSIVENESS = 2  # 0 (permissive) - 3 (strict); 2 is a reasonable default
+from lego_brain.media_client import MediaClient
 
 OUT_DIR = Path("debug_media")
-
-
-class Segmenter:
-    """Turns a stream of 30ms PCM16 frames into complete utterances,
-    using a pre-roll buffer (don't miss the start) and hangover (don't
-    cut the end). emit_fn(pcm_bytes) is called once per completed
-    utterance -- swap that for a Gemma call once this looks right.
-    """
-
-    def __init__(self, emit_fn):
-        self._vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-        self._preroll = deque(maxlen=PREROLL_FRAMES)
-        self._triggered = False
-        self._voiced = []
-        self._silence_run = 0
-        self._emit = emit_fn
-
-    def process(self, frame: bytes):
-        is_speech = self._vad.is_speech(frame, AUDIO_SAMPLE_RATE)
-
-        if not self._triggered:
-            self._preroll.append(frame)
-            if is_speech:
-                self._triggered = True
-                self._voiced = list(self._preroll)  # recover the onset
-                self._preroll.clear()
-                self._silence_run = 0
-            return
-
-        self._voiced.append(frame)
-        if is_speech:
-            self._silence_run = 0
-        else:
-            self._silence_run += 1
-            if self._silence_run >= HANGOVER_FRAMES:
-                self._emit(b"".join(self._voiced))
-                self._triggered = False
-                self._voiced = []
-                self._silence_run = 0
-
-    def flush(self):
-        """Call on disconnect so an in-progress utterance isn't lost."""
-        if self._triggered and self._voiced:
-            self._emit(b"".join(self._voiced))
-            self._triggered = False
-            self._voiced = []
-
-
-def _save_wav(pcm_bytes: bytes):
-    OUT_DIR.mkdir(exist_ok=True)
-    path = OUT_DIR / f"utterance_{time.strftime('%Y%m%d_%H%M%S')}.wav"
-    with wave.open(str(path), "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # int16
-        wf.setframerate(AUDIO_SAMPLE_RATE)
-        wf.writeframes(pcm_bytes)
-    duration = len(pcm_bytes) / 2 / AUDIO_SAMPLE_RATE
-    print(f"[pc_media_client] wrote {path} ({duration:.2f}s)")
 
 
 def _save_frame(jpeg_bytes: bytes, preview: bool):
@@ -132,32 +54,36 @@ def _save_frame(jpeg_bytes: bytes, preview: bool):
 
 
 async def run(host: str, preview: bool):
-    uri = f"ws://{host}:8001/media"
-    segmenter = Segmenter(_save_wav)
-    audio_carry = b""  # handles the case where a WS message doesn't land
-                        # exactly on a 30ms frame boundary
+    media_client = MediaClient(f"ws://{host}:8001/media")
 
-    print(f"[pc_media_client] connecting to {uri} ...")
-    async with websockets.connect(uri, max_size=None) as ws:
+    last_seen_frame = None
+    last_seen_utterance = None
+    OUT_DIR.mkdir(exist_ok=True)
+
+    print(f"[pc_media_client] connecting to {media_client.uri} ...")
+    task = asyncio.create_task(media_client.run_forever())
+    try:
         print("[pc_media_client] connected. Ctrl+C to stop.")
-        try:
-            async for message in ws:
-                msg_type, _ts = struct.unpack(">Bd", message[:9])
-                payload = message[9:]
+        while True:
+            # Polling media_client's in-memory state rather than
+            # re-implementing the WebSocket demux here too -- that
+            # logic (and the pre-roll/hangover segmenter) lives in
+            # media_client.py now, shared with pc_server.py.
+            if media_client.latest_frame is not last_seen_frame:
+                last_seen_frame = media_client.latest_frame
+                _save_frame(last_seen_frame, preview)
 
-                if msg_type == TYPE_VIDEO:
-                    _save_frame(payload, preview)
+            if media_client.latest_utterance_wav is not last_seen_utterance:
+                last_seen_utterance = media_client.latest_utterance_wav
+                path = OUT_DIR / f"utterance_{time.strftime('%Y%m%d_%H%M%S')}.wav"
+                path.write_bytes(last_seen_utterance)
+                print(f"[pc_media_client] wrote {path}")
 
-                elif msg_type == TYPE_AUDIO:
-                    audio_carry += payload
-                    while len(audio_carry) >= AUDIO_FRAME_BYTES:
-                        frame = audio_carry[:AUDIO_FRAME_BYTES]
-                        audio_carry = audio_carry[AUDIO_FRAME_BYTES:]
-                        segmenter.process(frame)
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            pass
-        finally:
-            segmenter.flush()
+            await asyncio.sleep(0.05)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        task.cancel()
 
 
 def main():

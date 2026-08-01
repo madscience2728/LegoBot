@@ -309,3 +309,23 @@ def read_angle(port: str = "A") -> dict:
 
 def goto_angle(port: str, target_degrees: float, **kwargs) -> dict:
     return _send("goto_angle", {"port": port, "target_degrees": target_degrees, **kwargs})
+
+
+# Generic dispatch, mirroring hub_controller.COMMANDS/dispatch() 1:1 --
+# same reasoning as that module's own comment: adding a command means
+# adding one function above and one line here, nowhere else. Exists so
+# callers that receive a command as data (e.g. pc_server.py's /command
+# endpoint, taking {"cmd": ..., "args": ...} off the wire) have a single
+# entrypoint instead of hand-rolling an if/elif per command name.
+COMMANDS = {
+    "stop": stop,
+    "set_speed": set_speed,
+    "read_angle": read_angle,
+    "goto_angle": goto_angle,
+}
+
+
+def dispatch(cmd: str, args: dict) -> dict:
+    if cmd not in COMMANDS:
+        raise ValueError(f"unknown command {cmd!r}, expected one of {list(COMMANDS)}")
+    return COMMANDS[cmd](**args)
