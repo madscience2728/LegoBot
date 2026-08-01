@@ -43,6 +43,60 @@ class HubNotReady(RuntimeError):
     requested port has no motor attached."""
 
 
+def _force_adapter_reset() -> None:
+    """Recovery for a specific bleak/BlueZ failure mode: if BleakScanner's
+    internal start() sends StartDiscovery over D-Bus but then raises
+    during its OWN post-start setup (before __aenter__ returns), the
+    `async with` block that's supposed to guarantee stop()/StopDiscovery
+    never gets entered -- __aexit__ only runs if __aenter__ succeeded.
+    BlueZ is left thinking discovery is running, forever, and every
+    _scan_once() call after that fails immediately with
+    org.bluez.Error.InProgress.
+
+    This used to call `bluetoothctl scan off`, then `bluetoothctl power
+    off` -> `power on`. Neither was enough -- confirmed in production
+    that a `power off` request can itself get REJECTED by bluetoothd:
+        bluetoothctl: Failed to set power off: org.bluez.Error.Failed
+    bluetoothctl talks to bluetoothd over D-Bus, and when the daemon is
+    wedged badly enough it can't even process the request meant to
+    unwedge it -- asking the stuck thing to fix itself, through the
+    interface that's stuck. `power on` then "succeeds" trivially (the
+    adapter's already on) without having cleared anything.
+
+    What's confirmed to actually work: a full `sudo reboot`, which kills
+    and restarts the bluetoothd PROCESS, giving it genuinely fresh
+    in-memory state rather than asking it nicely. Restarting just
+    bluetooth.service does the same thing -- a fresh daemon process,
+    same as the systemd fix in
+    robot_files/legobot-relay.service's ExecStartPre -- without a whole
+    OS reboot. Requires root (fine on the Pi, where this runs as root
+    under systemd; best-effort/silently-caught if this ever runs
+    unprivileged via the PC bypass path in robot_client.py).
+
+    Safe to call here: we only reach this path while still scanning,
+    i.e. before connect() has succeeded, so there's no live hub
+    connection to drop.
+
+    Same subprocess-bluetoothctl style as HubController._force_ble_disconnect,
+    for the same underlying reason: bleak/pylgbst don't expose a way to
+    do this from inside the failed call itself."""
+    try:
+        subprocess.run(
+            ["systemctl", "restart", "bluetooth.service"],
+            capture_output=True, text=True, timeout=10,
+        )
+        time.sleep(2.0)
+        subprocess.run(
+            ["bluetoothctl", "power", "on"],
+            capture_output=True, text=True, timeout=5,
+        )
+        time.sleep(1.0)
+    except Exception:
+        # Not fatal -- worst case this particular retry still hits
+        # InProgress and we try again next pass.
+        pass
+
+
 def _scan_once(timeout: float = 4.0) -> dict:
     """One BLE scan pass. Synchronous wrapper so callers (including the
     relay's plain background thread) don't need to think about asyncio."""
@@ -100,6 +154,7 @@ def wait_for_hub(hub_name: str, scan_timeout: float = 4.0, max_scans: int = None
                 raise HubNotReady(f"BLE scanning kept failing: {e}")
             if consecutive_scan_errors >= 15:
                 raise HubNotReady(f"BLE scanning failed {consecutive_scan_errors} times in a row: {e}")
+            _force_adapter_reset()
             time.sleep(2.0)
             continue
 

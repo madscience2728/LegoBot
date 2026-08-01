@@ -14,12 +14,38 @@ WorkingDirectory=/home/legobot
 # by hand after every reboot, do it here so the relay always starts
 # with a usable radio. Harmless no-op if it's already unblocked.
 ExecStartPre=/usr/sbin/rfkill unblock bluetooth
+# Every restart (crash-loop, `systemctl restart`, or a --deploy) SIGTERMs
+# the previous process. That process never gets a chance to call
+# StopDiscovery or Disconnect on its way out, so bluetoothd is left
+# thinking a scan is still running and/or the hub is still connected --
+# the next process's scan then fails outright with
+# org.bluez.Error.InProgress instead of ever finding the hub.
+#
+# This used to be `bluetoothctl power off` + `power on`. Confirmed in
+# production that doesn't reliably work: bluetoothctl talks to bluetoothd
+# over D-Bus, and when bluetoothd is wedged badly enough it can outright
+# REJECT the power-off request too --
+#   bluetoothctl: Failed to set power off: org.bluez.Error.Failed
+# -- asking the stuck daemon to please unstick itself, through the same
+# interface that's currently stuck, doesn't work. `power on` then
+# "succeeds" trivially (the adapter's already on) without having cleared
+# anything, and the new process inherits the exact same stuck state.
+#
+# What's confirmed to work: a full `sudo reboot`, which kills and
+# restarts the bluetoothd PROCESS itself, giving it genuinely fresh
+# in-memory state rather than asking it nicely. Restarting just
+# bluetooth.service does the same thing -- fresh daemon process, no
+# stuck state to inherit -- without needing a whole OS reboot or
+# depending on the daemon's D-Bus interface being responsive enough to
+# take the request in the first place.
+ExecStartPre=-/usr/bin/systemctl restart bluetooth.service
 # Belt-and-suspenders alongside the retry loop in relay_server.py: nudge
-# BlueZ to actually power the adapter on, in case bluetoothd hasn't done
-# so yet by the time we start (a plain "After=bluetooth.service" only
-# guarantees the daemon has started, not that it's finished registering
-# hci0 over D-Bus). The leading "-" means a failure here doesn't stop
-# the unit from starting -- the connect retry loop handles it either way.
+# BlueZ to actually power the adapter on, in case the restarted daemon's
+# default policy leaves it off until asked (a plain
+# "After=bluetooth.service" only guarantees the daemon has started, not
+# that it's finished registering hci0 over D-Bus, or that it's powered).
+# The leading "-" means a failure here doesn't stop the unit from
+# starting -- the connect retry loop handles it either way.
 ExecStartPre=-/usr/bin/bluetoothctl power on
 # Under systemd, stdout is a pipe to journald, not a real tty -- Python
 # defaults to fully block-buffered output in that case (vs. line-buffered

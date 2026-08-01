@@ -9,7 +9,7 @@ module underneath it.
 Usage:
     python3 main.py                # health check, then interactive control
     python3 main.py --deploy       # push src/lego_pi + src/lego_control to
-                                    # the Pi first, then health check + control
+                                    # the Pi, restart its relay service, exit
     python3 main.py --health-only  # report reachability/route and exit
 
 What this does NOT do:
@@ -70,7 +70,7 @@ def main():
     parser.add_argument(
         "--deploy",
         action="store_true",
-        help="push src/lego_pi + src/lego_control to the Pi and restart its relay service first",
+        help="push src/lego_pi + src/lego_control to the Pi, restart its relay service, then exit",
     )
     parser.add_argument(
         "--health-only",
@@ -81,6 +81,7 @@ def main():
 
     if args.deploy:
         _run_deploy()
+        return
 
     reachable = _report_health()
 

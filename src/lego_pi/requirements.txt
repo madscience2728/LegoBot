@@ -1,6 +1,13 @@
 # Dependencies for running on the Pi: lego_pi/relay_server.py (FastAPI +
-# uvicorn) and lego_control/hub_controller.py (pylgbst + bleak), since
-# both packages get deployed together and run in the same interpreter.
+# uvicorn), lego_pi/media_relay.py (camera/mic capture), and
+# lego_control/hub_controller.py (pylgbst + bleak), since all of this
+# gets deployed together and runs in the same interpreter (see
+# lego_pi/__main__.py -- both FastAPI apps boot in one process).
 fastapi
 uvicorn
 pylgbst[bleak]
+
+# media_relay.py -- camera + mic capture
+opencv-python-headless
+sounddevice
+numpy

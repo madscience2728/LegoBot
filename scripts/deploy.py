@@ -168,6 +168,46 @@ def _ensure_pip(client: paramiko.SSHClient, password: str):
     print("  python3-pip installed.")
 
 
+def _ensure_portaudio(client: paramiko.SSHClient, password: str):
+    """sounddevice (in requirements.txt, for media_relay.py) is only a
+    Python wrapper -- pip installing it does NOT pull in libportaudio2,
+    the native shared library it binds to via ctypes. On Linux that has
+    to come from apt; the Windows/Mac wheels happen to bundle their own
+    copy, which is why this gap doesn't show up testing on a PC. Without
+    it, `import sounddevice` raises OSError at process startup, which
+    crash-loops the whole relay service (both apps, since __main__.py
+    imports media_relay before either server binds) even though nothing
+    about robot control itself is broken. Same check-first pattern as
+    _ensure_pip: only pay the apt-get cost the one time it's missing.
+
+    Checks via `dpkg -s`, not `ldconfig -p` -- ldconfig lives in /sbin,
+    which typically isn't on a non-root SSH user's PATH (only root's).
+    Running it unqualified over paramiko's exec_command silently hit
+    "command not found", produced empty output, and made this check
+    report "not installed" on every single deploy regardless of whether
+    it actually was -- the install itself was sticking fine, only the
+    check couldn't see it. dpkg is on PATH for every user by default and
+    is the actual source of truth for package state anyway, not a
+    downstream side effect of it."""
+    status, _, _ = run_remote_command(
+        client, "dpkg -s libportaudio2", password
+    )
+    if status == 0:
+        return
+
+    print("  libportaudio2 not found on the Pi -- installing via apt (one-time)...")
+    cmd = (
+        "bash -c "
+        "'DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libportaudio2'"
+    )
+    status, out, err = run_remote_command(client, cmd, password, sudo=True)
+    if status != 0:
+        print(f"  apt-get install libportaudio2 FAILED (exit {status}):\n{err or out}")
+        sys.exit(1)
+    print("  libportaudio2 installed.")
+
+
 def install_dependencies(client: paramiko.SSHClient, password: str):
     """Installs whatever's in lego_pi/requirements.txt on the Pi. Runs
     every deploy, same reasoning as sync_service: an idempotent pip
@@ -183,6 +223,7 @@ def install_dependencies(client: paramiko.SSHClient, password: str):
     """
     print("Installing Pi-side dependencies (lego_pi/requirements.txt)...")
     _ensure_pip(client, password)
+    _ensure_portaudio(client, password)
     cmd = "python3 -m pip install --break-system-packages -q -r lego_pi/requirements.txt"
     status, out, err = run_remote_command(client, cmd, password, sudo=True)
     if status != 0:
