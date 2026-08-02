@@ -75,7 +75,10 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 def health():
-    return robot_client.health()
+    try:
+        return robot_client.health()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"health check failed: {e}")
 
 
 @app.post("/command")

@@ -341,8 +341,21 @@ def health() -> dict:
         if result is not None:
             result["_route"] = "pi_relay"
             return result
-        # answered a moment ago in _resolve_route but not now -- treat
-        # like any other mid-flight failure and fall through to direct.
+        # A single failed probe right after _resolve_route() just
+        # confirmed the Pi reachable is a momentary blip, not grounds to
+        # fall through to _local() -- which, with the PC's own Bluetooth
+        # radio off (the normal setup in this project), can block for
+        # ~30s scanning for nothing. That turned a caller's reasonable
+        # few-second timeout (pc_server.py's /health, call_server.py's
+        # --health) into a mysterious multi-second hang and a confusing
+        # ReadTimeout with no indication why. Report the miss directly
+        # instead -- same reasoning as _send()'s 409 handling: don't
+        # treat every hiccup as "fall back to direct BLE."
+        raise RuntimeError(
+            "Pi relay was reachable a moment ago but this /health probe "
+            "got no response -- transient blip, or the relay just went "
+            "down. Not falling back to direct BLE for a health check."
+        )
     result = _local().health()
     result["_route"] = "direct_ble"
     return result
@@ -352,12 +365,32 @@ def stop(port: str = "A", hub: str = "front") -> dict:
     return _send("stop", {"port": port}, hub=hub)
 
 
-def set_speed(port: str, speed: float, hub: str = "front") -> dict:
-    return _send("set_speed", {"port": port, "speed": speed}, hub=hub)
+def set_speed(port: str, speed: float, hub: str = "front", invert: bool = False) -> dict:
+    return _send("set_speed", {"port": port, "speed": speed, "invert": invert}, hub=hub)
 
 
 def read_angle(port: str = "A", hub: str = "front") -> dict:
     return _send("read_angle", {"port": port}, hub=hub)
+
+
+def preset_zero(port: str, hub: str = "front") -> dict:
+    return _send("preset_zero", {"port": port}, hub=hub)
+
+
+def describe_port(port: str, hub: str = "front", **kwargs) -> dict:
+    return _send("describe_port", {"port": port, **kwargs}, hub=hub)
+
+
+def read_apos(port: str = "A", hub: str = "front") -> dict:
+    return _send("read_apos", {"port": port}, hub=hub)
+
+
+def home_angle(port: str, target_degrees: float = 0.0, hub: str = "front", **kwargs) -> dict:
+    return _send("home_angle", {"port": port, "target_degrees": target_degrees, **kwargs}, hub=hub)
+
+
+def set_position(port: str, target_degrees: float, hub: str = "front", **kwargs) -> dict:
+    return _send("set_position", {"port": port, "target_degrees": target_degrees, **kwargs}, hub=hub)
 
 
 def goto_angle(port: str, target_degrees: float, hub: str = "front", **kwargs) -> dict:
@@ -375,6 +408,11 @@ COMMANDS = {
     "stop": stop,
     "set_speed": set_speed,
     "read_angle": read_angle,
+    "preset_zero": preset_zero,
+    "describe_port": describe_port,
+    "read_apos": read_apos,
+    "home_angle": home_angle,
+    "set_position": set_position,
     "goto_angle": goto_angle,
 }
 

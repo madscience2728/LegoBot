@@ -18,7 +18,7 @@ pip install "pylgbst[bleak]"
 
 import subprocess
 import time
-from struct import pack
+from struct import pack, unpack
 
 import bleak
 
@@ -192,6 +192,19 @@ class HubController:
         # the life of the connection (see _ensure_angle_subscription).
         self._angle_state: dict = {}
         self._angle_subscribed_ports: set = set()
+        # Same idea, but for the motor's TRUE magnet-based absolute
+        # position (mode 3, "APOS") -- see _ensure_apos_subscription and
+        # home_angle. Confirmed via describe_port against the actual
+        # 88017 Large Angular Motor: 16-bit signed, range -180..179.
+        self._apos_state: dict = {}
+        self._apos_subscribed_ports: set = set()
+
+    # This motor's true magnet-based absolute position mode, confirmed
+    # via describe_port's live query of the actual device (Mode 3,
+    # "APOS", 16-bit signed, -180..179 degrees) -- NOT pylgbst's
+    # SENSOR_ANGLE (mode 2, "POS"), which is a 32-bit RELATIVE counter
+    # that doesn't persist across reconnects.
+    APOS_MODE = 3
 
     # -- lifecycle -----------------------------------------------------
 
@@ -295,6 +308,55 @@ class HubController:
             raise HubNotReady(f"no motor attached on port {port}")
         return motor
 
+    def describe_port(self, port: str, max_mode: int = 7) -> dict:
+        """Diagnostic only -- queries the LIVE device for its actual mode
+        table (names, byte widths, ranges), needed before reading a
+        non-standard mode directly: pylgbst's built-in EncodedMotor only
+        knows how to parse mode 2 (SENSOR_ANGLE, its "POS"/relative
+        position, 4-byte int) -- everything else falls through to a
+        1-byte parse, which would silently misread mode 3 (APOS, this
+        motor's true magnet-based absolute position -- see
+        preset_zero's docstring and the 88017 Large Angular Motor's
+        spec sheet). Rather than assume APOS's exact wire width and
+        risk shipping code that parses garbage without any error, ask
+        the actual connected device what its mode 3 really looks like,
+        once, and use that ground truth.
+
+        Deliberately NOT pylgbst's own describe_possible_modes() --
+        that brute-forces mode numbers 0-255, each a separate BLE
+        round-trip, which blew straight through every timeout in the
+        chain (robot_client's 15s to the Pi, call_server.py's 20s on
+        top of that) for a motor that only has a handful of real modes.
+        Same underlying per-mode query (Peripheral._describe_mode),
+        just over a small range instead of all 256."""
+        motor = self._motor(port)
+        return {"port": port, "modes": [motor._describe_mode(m) for m in range(max_mode)]}
+
+    def _switch_mode_and_subscribe(self, motor, mode: int, callback) -> None:
+        """Shared by _ensure_angle_subscription (mode 2, POS) and
+        _ensure_apos_subscription (mode 3, APOS) -- pylgbst only
+        supports one active subscription mode per port at a time
+        (Peripheral.subscribe() raises ValueError if you try to switch
+        modes while a callback from the OTHER mode is still registered).
+        That's a real constraint here: this project reads a port in
+        mode 2 via goto_angle/read_angle and in mode 3 via
+        read_apos/home_angle, and a given port might switch between
+        them across a session (e.g. try goto_angle first, then switch
+        to the APOS-based approach once that proves unreliable for a
+        bounded servo -- exactly what happened during development).
+
+        Bypasses motor.subscribe()'s guard on purpose: clears whatever
+        was subscribed before (stale callbacks from the other mode
+        would otherwise silently keep receiving data under a
+        misleading key, e.g. mode-2's on_angle receiving mode-3 apos
+        values), then calls set_port_mode directly -- the actual mode
+        switch underneath that wrapper, just without the restriction
+        that doesn't fit "one port, two modes, different times."
+        """
+        motor._subscribers.clear()
+        motor.set_port_mode(mode, True, 1)
+        motor._subscribers.add(callback)
+
     def _ensure_angle_subscription(self, port: str, wait_timeout: float = 3.0) -> dict:
         """
         Subscribe to a port's angle sensor exactly once, and leave it
@@ -309,6 +371,15 @@ class HubController:
         cycle (e.g. calling read_angle right before goto_angle) can hang
         waiting for a callback that never comes. Subscribing once and
         reading the live-updated dict sidesteps that entirely.
+
+        Reads mode 2 ("POS") -- a 32-bit RELATIVE counter, not this
+        motor's true absolute position. Fine for continuously-rotating
+        motors (wheels) that don't have real absolute sensing anyway.
+        For a bounded servo with genuine magnet-based absolute
+        positioning, see read_apos/home_angle instead -- goto_angle
+        built on THIS mode is what needed manual re-calibration every
+        session; that limitation is inherent to mode 2, not fixable
+        here.
         """
         motor = self._motor(port)
         state = self._angle_state.setdefault(port, {"angle": None})
@@ -317,14 +388,137 @@ class HubController:
             def on_angle(angle, _state=state):
                 _state["angle"] = angle
 
-            motor.subscribe(on_angle, mode=motor.SENSOR_ANGLE)
+            self._switch_mode_and_subscribe(motor, motor.SENSOR_ANGLE, on_angle)
             self._angle_subscribed_ports.add(port)
+            self._apos_subscribed_ports.discard(port)  # mode-3 subscription (if any) no longer valid
 
             deadline = time.time() + wait_timeout
             while state["angle"] is None and time.time() < deadline:
                 time.sleep(0.01)
 
         return state
+
+    @staticmethod
+    def _patch_apos_decoding(motor) -> None:
+        """pylgbst's EncodedMotor._decode_port_data() only knows how to
+        parse mode 2 (4-byte int) and mode 1 (1-byte int) -- for mode 3
+        (APOS) it hits an unhandled else branch and returns an empty
+        tuple, so a callback subscribed to mode 3 through pylgbst's
+        normal API silently never fires at all, no error raised.
+
+        Patches THIS motor instance (not the class -- other motors on
+        other ports are unaffected) to also decode mode 3 correctly,
+        alongside the original logic for every other mode. Format
+        confirmed via describe_port's live query of the actual device:
+        16-bit signed, matching APOS's real -180..179 degree range
+        (a signed byte, pylgbst's fallback width, can't even represent
+        that range -- would silently truncate/wrap)."""
+        if getattr(motor, "_apos_decode_patched", False):
+            return
+        original_decode = motor._decode_port_data
+
+        def patched_decode(msg, _original=original_decode, _motor=motor):
+            if _motor._port_mode.mode == HubController.APOS_MODE:
+                apos = unpack("<h", msg.payload[0:2])[0]
+                return (apos,)
+            return _original(msg)
+
+        motor._decode_port_data = patched_decode
+        motor._apos_decode_patched = True
+
+    def _ensure_apos_subscription(self, port: str, wait_timeout: float = 3.0) -> dict:
+        """Same idea as _ensure_angle_subscription, but for the motor's
+        TRUE magnet-based absolute position (mode 3, "APOS") instead of
+        the relative "POS" mode (2) pylgbst's SENSOR_ANGLE reads.
+
+        This is the mode that doesn't need calibrating every session --
+        APOS is tied to a physical magnet, not a counter that starts
+        wherever tracking happens to begin. See read_apos/home_angle."""
+        motor = self._motor(port)
+        state = self._apos_state.setdefault(port, {"apos": None})
+
+        if port not in self._apos_subscribed_ports:
+            self._patch_apos_decoding(motor)
+
+            def on_apos(apos, _state=state):
+                _state["apos"] = apos
+
+            self._switch_mode_and_subscribe(motor, self.APOS_MODE, on_apos)
+            self._apos_subscribed_ports.add(port)
+            self._angle_subscribed_ports.discard(port)  # mode-2 subscription (if any) no longer valid
+
+            deadline = time.time() + wait_timeout
+            while state["apos"] is None and time.time() < deadline:
+                time.sleep(0.01)
+
+        return state
+
+    def read_apos(self, port: str = "A", timeout: float = 2.0) -> dict:
+        """The motor's TRUE magnet-based absolute position. Unlike
+        read_angle (mode 2, relative), this needs no calibration --
+        ever -- since it's tied to a physical magnet position, not a
+        counter that resets to "wherever tracking started" each
+        session."""
+        state = self._ensure_apos_subscription(port, wait_timeout=timeout)
+        if state["apos"] is None:
+            raise HubNotReady(f"no APOS data from encoder on port {port}")
+        return {"port": port, "apos": state["apos"]}
+
+    def home_angle(
+        self,
+        port: str,
+        target_degrees: float = 0.0,
+        speed: float = 0.5,
+        max_power: float = 1.0,
+        invert: bool = False,
+        timeout: float = 6.0,
+    ) -> dict:
+        """Moves to a target angle using the motor's TRUE absolute
+        position (APOS) as the reference -- no manual calibration
+        needed, ever, since APOS is magnet-based and survives
+        reconnects/power cycles. This is the actual fix for "servo
+        needs to find 0 on its own."
+
+        GotoAbsolutePosition (pylgbst's goto_position / this project's
+        own set_position) does NOT honor APOS despite its name --
+        confirmed independently: it's aligned with the relative POS
+        counter instead (see set_position's docstring for the source).
+        So this reads the current TRUE position, computes the needed
+        RELATIVE move (shortest path across the -180/180 wraparound),
+        and sends that via angled() -- a genuinely relative rotation
+        command -- rather than trusting GotoAbsolutePosition with a
+        target it doesn't actually respect.
+
+        target_degrees should stay within roughly -170..170. APOS
+        itself is hard-bounded to -180..179 (this motor's real
+        mechanical/sensor range, confirmed via describe_port) -- there's
+        no "multiple turns" concept here the way the old POS-based
+        goto_angle assumed, which is what let it accumulate thousands of
+        degrees of nonsensical drift in the first place.
+        """
+        state = self._ensure_apos_subscription(port, wait_timeout=2.0)
+        if state["apos"] is None:
+            raise HubNotReady(f"no APOS data from encoder on port {port}")
+
+        current = state["apos"]
+        delta = target_degrees - current
+        if delta > 180:
+            delta -= 360
+        elif delta < -180:
+            delta += 360
+
+        motor = self._motor(port)
+        actual_delta = -delta if invert else delta
+        motor.angled(actual_delta, speed_primary=speed, max_power=max_power, wait_complete=True)
+
+        state = self._ensure_apos_subscription(port, wait_timeout=timeout)
+        final_apos = state["apos"]
+        return {
+            "ok": True,
+            "port": port,
+            "target": target_degrees,
+            "final_apos": final_apos,
+        }
 
     @staticmethod
     def _start_speed_nonblocking(motor, speed, max_power=1.0, use_profile=0b11):
@@ -348,17 +542,111 @@ class HubController:
         motor.stop()
         return {"ok": True, "port": port}
 
-    def set_speed(self, port: str, speed: float) -> dict:
-        """Continuous speed, -1.0..1.0. Runs until the next stop/command."""
+    def set_speed(self, port: str, speed: float, invert: bool = False) -> dict:
+        """Continuous speed, -1.0..1.0. Runs until the next stop/command.
+
+        invert: some motors are mounted with their physical rotation
+        direction reversed relative to the software's positive-speed
+        convention -- this robot has several (see relay_server.py's
+        wheel/port map). Rather than making every caller remember to
+        negate `speed` for those specific ports, invert=True does it
+        here, once, so the port's quirk lives next to the port instead
+        of scattered across every call site that happens to know about
+        it."""
         motor = self._motor(port)
-        self._start_speed_nonblocking(motor, speed)
-        return {"ok": True, "port": port, "speed": speed}
+        actual_speed = -speed if invert else speed
+        self._start_speed_nonblocking(motor, actual_speed)
+        return {"ok": True, "port": port, "speed": speed, "invert": invert}
 
     def read_angle(self, port: str = "A", timeout: float = 2.0) -> dict:
         state = self._ensure_angle_subscription(port, wait_timeout=timeout)
         if state["angle"] is None:
             raise HubNotReady(f"no angle data from encoder on port {port}")
         return {"port": port, "angle": state["angle"]}
+
+    def preset_zero(self, port: str) -> dict:
+        """Recalibrates this motor's encoder so its CURRENT physical
+        position becomes angle 0, going forward. Necessary any time a
+        motor's raw zero reference doesn't match its actual physical
+        neutral -- e.g. a Technic angular servo whose dots-aligned
+        (true mechanical center) position reads as 180 instead of 0.
+        Every goto_angle() target is computed relative to whatever the
+        encoder currently calls "0", so with an uncalibrated offset like
+        that, targets end up pointed at physically out-of-range
+        positions -- which looks exactly like a jammed motor (spins/
+        vibrates, doesn't move) when it's actually just straining
+        against a real mechanical end-stop it was never going to reach.
+
+        IMPORTANT: call this ONLY while the motor is actually sitting at
+        the physical position you want to become "0" (e.g. the servo's
+        alignment dots lined up). Calling it anywhere else bakes in a
+        wrong reference just as surely as the one it's meant to fix.
+
+        Wraps pylgbst's EncodedMotor.preset_encoder() -- see
+        https://lego.github.io/lego-ble-wireless-protocol-docs/index.html#output-sub-command-presetencoder-position-n-a
+        This is a firmware-level command; the hub remembers the new
+        zero itself, not just this process's in-memory state.
+        """
+        motor = self._motor(port)
+        motor.preset_encoder(degrees=0)
+        # Angle subscription state can lag a beat behind the hardware
+        # actually re-zeroing -- read back post-calibration so the
+        # caller sees confirmation, not a stale pre-calibration value.
+        state = self._ensure_angle_subscription(port, wait_timeout=2.0)
+        return {"ok": True, "port": port, "angle_after_preset": state["angle"]}
+
+    def set_position(
+        self,
+        port: str,
+        target_degrees: float,
+        speed: float = 1.0,
+        max_power: float = 1.0,
+        invert: bool = False,
+        timeout: float = 6.0,
+    ) -> dict:
+        """Firmware-level absolute move, using pylgbst's native
+        EncodedMotor.goto_position() instead of this project's own
+        hand-rolled goto_angle() P-loop.
+
+        goto_angle() exists specifically because it lets you inspect
+        encoder feedback and intervene mid-move (see its own docstring,
+        and tests/goto_angle_closed_loop.py) -- valuable for the drive
+        wheels, but goto_angle is P-only: proportional term, no
+        derivative/damping, no smooth deceleration ramp. That's a
+        textbook recipe for exactly the overshoot/hunting oscillation
+        this project hit tuning a bounded tilt servo by hand (bounces
+        between two angles, doesn't settle) -- a well-known limitation
+        of P-only control, not a pylgbst bug.
+
+        set_position hands the move to the hub's OWN onboard
+        acceleration/deceleration profile instead (the "use_profile"
+        wire parameter) -- LEGO's firmware handles ramping smoothly, no
+        PC-side polling loop needed. Right tool for "go to this angle
+        and stop", which is all a tilt servo needs; goto_angle remains
+        the right tool where mid-move encoder intervention actually
+        matters.
+
+        invert: same meaning as set_speed/goto_angle's -- negates what's
+        sent to the motor, not target_degrees itself.
+
+        https://lego.github.io/lego-ble-wireless-protocol-docs/index.html#output-sub-command-gotoabsoluteposition-abspos-speed-maxpower-endstate-useprofile-0x0d
+        """
+        motor = self._motor(port)
+        actual_target = -target_degrees if invert else target_degrees
+        motor.goto_position(
+            actual_target,
+            speed=speed,
+            max_power=max_power,
+            wait_complete=True,
+        )
+        state = self._ensure_angle_subscription(port, wait_timeout=timeout)
+        final_angle = state["angle"]
+        return {
+            "ok": True,
+            "port": port,
+            "target": target_degrees,
+            "final_angle": final_angle,
+        }
 
     def goto_angle(
         self,
@@ -371,10 +659,20 @@ class HubController:
         settle_reads: int = 5,
         poll_interval: float = 0.02,
         timeout: float = 6.0,
+        invert: bool = False,
     ) -> dict:
         """Closed-loop move, ported from tests/goto_angle_closed_loop.py.
         See that file's docstring for why this exists instead of the
-        stock motor.goto_position()."""
+        stock motor.goto_position().
+
+        invert: same meaning as set_speed's -- some motors' physical
+        rotation is reversed relative to software's positive-speed
+        convention. Deliberately only flips the sign of what's actually
+        sent to the motor (see the one line below) -- target_degrees,
+        error, and final_angle all stay in normal, non-inverted terms
+        for the caller. The closed loop still converges correctly
+        either way, since error is computed from the encoder's own
+        self-consistent readings, not from anything invert touches."""
         motor = self._motor(port)
         state = self._ensure_angle_subscription(port, wait_timeout=2.0)
         if state["angle"] is None:
@@ -403,7 +701,7 @@ class HubController:
                     magnitude = min(max(abs(raw_speed), min_speed), max_speed)
                     speed = magnitude if error > 0 else -magnitude
 
-                self._start_speed_nonblocking(motor, speed)
+                self._start_speed_nonblocking(motor, -speed if invert else speed)
                 time.sleep(poll_interval)
         finally:
             # Deliberately NOT unsubscribing here -- the angle
@@ -430,6 +728,11 @@ COMMANDS = {
     "stop": HubController.stop,
     "set_speed": HubController.set_speed,
     "read_angle": HubController.read_angle,
+    "preset_zero": HubController.preset_zero,
+    "describe_port": HubController.describe_port,
+    "read_apos": HubController.read_apos,
+    "home_angle": HubController.home_angle,
+    "set_position": HubController.set_position,
     "goto_angle": HubController.goto_angle,
 }
 
