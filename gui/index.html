@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LegoBot &middot; Phone Probe</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="brand">
+      <span class="dot off" id="connDot"></span>
+      <div>
+        <h1>LegoBot Phone Probe</h1>
+        <div class="sub" id="connSub">not connected</div>
+      </div>
+    </div>
+    <form class="connect-form" id="connectForm">
+      <input type="text" id="ipInput" placeholder="phone IP, e.g. 192.168.4.127" autocomplete="off">
+      <button type="submit" class="btn-connect">Connect</button>
+      <button type="button" class="btn-disconnect" id="disconnectBtn">Disconnect</button>
+    </form>
+  </header>
+
+  <div class="grid">
+
+    <!-- CAMERA -->
+    <section class="panel p-camera">
+      <h2>Camera <span class="badge" id="camBadge">no signal</span></h2>
+      <div class="camera-frame" id="cameraFrame">
+        <img id="cameraImg" alt="camera frame">
+        <div class="placeholder">Waiting for video frames from ws://&lt;phone&gt;:8001/media&hellip;<br>Back camera, ~5&nbsp;fps, JPEG q70, streamed while MediaRelayService is running.</div>
+        <div class="camera-overlay">
+          <span id="camFps">-- fps</span>
+          <span id="camLatency">latency -- ms</span>
+          <span id="camSize">-- KB</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- MIC -->
+    <section class="panel p-mic">
+      <h2>Mic Level <span class="badge" id="micBadge">no signal</span></h2>
+      <div class="mic-body">
+        <div class="meter-col">
+          <div class="meter-track"><div class="meter-fill" id="meterFill"></div></div>
+          <div class="val" id="micDbfs">-- dB</div>
+        </div>
+        <div class="mic-side">
+          <canvas class="spark" id="micSpark"></canvas>
+          <div>
+            <div class="stat-line"><span>sample rate</span><b>16 kHz mono PCM16</b></div>
+            <div class="stat-line"><span>frame size</span><b>30 ms (960 B)</b></div>
+            <div class="stat-line"><span>last latency</span><b id="micLatency">--</b></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- HEALTH -->
+    <section class="panel p-health">
+      <h2>Health <span class="badge" id="healthBadge">--</span></h2>
+      <div class="kv" id="healthKv">
+        <div class="kv-row"><span>device</span><span>--</span></div>
+        <div class="kv-row"><span>android sdk</span><span>--</span></div>
+        <div class="kv-row"><span>last check</span><span>--</span></div>
+      </div>
+    </section>
+
+    <!-- BLE -->
+    <section class="panel p-ble">
+      <h2>Bluetooth &middot; devices seen <span class="badge" id="bleBadge">--</span></h2>
+      <ul class="ble-list" id="bleList">
+        <li class="empty-note" style="border:none;background:none;">No scan yet.</li>
+      </ul>
+      <div class="timing-note">Probe currently only scans (no GATT connect) &mdash; this is "seen nearby", not "paired".</div>
+    </section>
+
+    <!-- TIMING -->
+    <section class="panel p-timing">
+      <h2>Network Timing</h2>
+
+      <div class="timing-block">
+        <div class="title"><span>video latency</span><span id="vidTimingNums">-- / -- / -- ms</span></div>
+        <canvas class="spark" id="vidSpark"></canvas>
+      </div>
+
+      <div class="timing-block">
+        <div class="title"><span>audio latency</span><span id="audTimingNums">-- / -- / -- ms</span></div>
+        <canvas class="spark" id="audSpark"></canvas>
+      </div>
+
+      <div class="stat-line"><span>video fps / staleness</span><b id="vidFpsAge">--</b></div>
+      <div class="stat-line"><span>audio fps / staleness</span><b id="audFpsAge">--</b></div>
+
+      <div class="timing-note">Latency = this PC's clock minus the phone's capture timestamp at send time. Reflects network + processing delay, plus any phone/PC clock offset &mdash; watch the trend, not the absolute number, unless both clocks are NTP-synced.</div>
+    </section>
+
+    <!-- COMMAND CONSOLE -->
+    <section class="panel p-command">
+      <h2>Command Console <span class="badge" id="cmdBadge">dummy channel</span></h2>
+      <div class="cmd-body">
+        <form class="cmd-form" id="cmdForm">
+          <div class="cmd-row">
+            <label>cmd</label>
+            <input type="text" id="cmdName" placeholder="e.g. set_speed" autocomplete="off">
+            <label>hub</label>
+            <select id="cmdHub">
+              <option value="front">front</option>
+              <option value="rear">rear</option>
+            </select>
+            <button type="submit" class="btn-connect">Send</button>
+          </div>
+          <div class="cmd-row">
+            <label>args (json)</label>
+            <input type="text" id="cmdArgs" value="{}" autocomplete="off">
+          </div>
+        </form>
+        <ul class="cmd-log" id="cmdLog">
+          <li class="empty-note" style="border:none;background:none;">No commands sent yet &mdash; this hits the phone's dummy /command endpoint, which logs and echoes back without touching any hardware.</li>
+        </ul>
+      </div>
+    </section>
+
+  </div>
+
+  <footer>server.py relays phone:8765 (HTTP) and phone:8001/media (WebSocket) &rarr; browser via /ws</footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+const els = {
+  connDot: $('connDot'), connSub: $('connSub'),
+  camBadge: $('camBadge'), cameraFrame: $('cameraFrame'), cameraImg: $('cameraImg'),
+  camFps: $('camFps'), camLatency: $('camLatency'), camSize: $('camSize'),
+  micBadge: $('micBadge'), meterFill: $('meterFill'), micDbfs: $('micDbfs'), micLatency: $('micLatency'),
+  healthBadge: $('healthBadge'), healthKv: $('healthKv'),
+  bleBadge: $('bleBadge'), bleList: $('bleList'),
+  vidTimingNums: $('vidTimingNums'), audTimingNums: $('audTimingNums'),
+  vidFpsAge: $('vidFpsAge'), audFpsAge: $('audFpsAge'),
+  cmdBadge: $('cmdBadge'), cmdLog: $('cmdLog'),
+};
+
+// ---- sparkline helper (plain canvas, no deps) ----
+function drawSpark(canvas, data, color) {
+  if (!canvas.width || canvas.width !== canvas.clientWidth * devicePixelRatio) {
+    canvas.width = canvas.clientWidth * devicePixelRatio;
+    canvas.height = canvas.clientHeight * devicePixelRatio;
+  }
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  if (!data || data.length < 2) return;
+  const max = Math.max(...data, 1);
+  const min = Math.min(...data, 0);
+  const range = Math.max(max - min, 1);
+  const step = w / (data.length - 1);
+  ctx.beginPath();
+  data.forEach((v, i) => {
+    const x = i * step;
+    const y = h - ((v - min) / range) * (h - 6) - 3;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5 * devicePixelRatio;
+  ctx.stroke();
+  ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
+  ctx.fillStyle = color + '22';
+  ctx.fill();
+}
+
+const micHistory = [];
+
+function setBadge(el, text, cls) {
+  el.textContent = text;
+  el.className = 'badge' + (cls ? ' ' + cls : '');
+}
+
+function fmtAge(ms) {
+  if (ms == null) return '--';
+  if (ms < 1500) return `${Math.round(ms)} ms ago`;
+  return `${(ms / 1000).toFixed(1)} s ago`;
+}
+
+function handleMessage(msg) {
+  switch (msg.type) {
+    case 'conn_status': {
+      const sub = msg.phone_ip ? `phone ${msg.phone_ip}` : 'not connected';
+      els.connSub.textContent = msg.error ? `${sub} — ${msg.error}` : sub;
+      els.connDot.className = 'dot ' + (msg.media_connected ? 'live' : (msg.phone_ip ? 'warn' : 'off'));
+      if (!msg.media_connected) {
+        setBadge(els.camBadge, msg.phone_ip ? 'reconnecting…' : 'no signal', msg.phone_ip ? 'pending' : '');
+        setBadge(els.micBadge, msg.phone_ip ? 'reconnecting…' : 'no signal', msg.phone_ip ? 'pending' : '');
+      }
+      break;
+    }
+
+    case 'video_frame': {
+      els.cameraImg.src = 'data:image/jpeg;base64,' + msg.b64;
+      els.cameraFrame.classList.add('has-frame');
+      setBadge(els.camBadge, 'live', 'ok');
+      els.camLatency.textContent = `latency ${msg.latency_ms} ms`;
+      els.camSize.textContent = `${(msg.bytes / 1024).toFixed(1)} KB`;
+      break;
+    }
+
+    case 'audio_level': {
+      setBadge(els.micBadge, 'live', 'ok');
+      els.meterFill.style.height = `${Math.round(msg.level * 100)}%`;
+      els.micDbfs.textContent = `${msg.dbfs} dB`;
+      els.micLatency.textContent = `${msg.latency_ms} ms`;
+      micHistory.push(msg.level);
+      if (micHistory.length > 150) micHistory.shift();
+      drawSpark($('micSpark'), micHistory, '#e8a838');
+      break;
+    }
+
+    case 'health': {
+      if (msg.ok && msg.data) {
+        setBadge(els.healthBadge, 'ok', 'ok');
+        els.healthKv.innerHTML = `
+          <div class="kv-row"><span>device</span><span>${escapeHtml(msg.data.device ?? '--')}</span></div>
+          <div class="kv-row"><span>android sdk</span><span>${escapeHtml(String(msg.data.android_sdk ?? '--'))}</span></div>
+          <div class="kv-row"><span>last check</span><span>${new Date(msg.ts * 1000).toLocaleTimeString()}</span></div>`;
+      } else {
+        setBadge(els.healthBadge, 'unreachable', 'bad');
+        els.healthKv.innerHTML = `<div class="kv-row"><span>error</span><span>${escapeHtml(msg.error ?? 'unknown')}</span></div>`;
+      }
+      break;
+    }
+
+    case 'ble': {
+      if (msg.ok && msg.data) {
+        const devices = msg.data.devices ?? [];
+        setBadge(els.bleBadge, `${devices.length} seen`, devices.length ? 'ok' : '');
+        els.bleList.innerHTML = devices.length
+          ? devices
+              .sort((a, b) => b.rssi - a.rssi)
+              .map(d => `<li><span>${escapeHtml(d.name || '(unnamed)')} <span class="addr">${escapeHtml(d.address)}</span></span><span class="rssi">${d.rssi} dBm</span></li>`)
+              .join('')
+          : '<li class="empty-note" style="border:none;background:none;">No devices in range.</li>';
+      } else {
+        setBadge(els.bleBadge, 'error', 'bad');
+        els.bleList.innerHTML = `<li class="empty-note" style="border:none;background:none;">${escapeHtml(msg.error ?? 'scan failed')}</li>`;
+      }
+      break;
+    }
+
+    case 'timing': {
+      const v = msg.video, a = msg.audio;
+      els.vidTimingNums.textContent = v.avg_latency_ms == null ? '-- / -- / -- ms' : `${v.min_latency_ms} / ${v.avg_latency_ms} / ${v.max_latency_ms} ms`;
+      els.audTimingNums.textContent = a.avg_latency_ms == null ? '-- / -- / -- ms' : `${a.min_latency_ms} / ${a.avg_latency_ms} / ${a.max_latency_ms} ms`;
+      els.vidFpsAge.textContent = `${v.fps} fps · ${fmtAge(v.last_frame_age_ms)}`;
+      els.audFpsAge.textContent = `${a.fps} fps · ${fmtAge(a.last_frame_age_ms)}`;
+      drawSpark($('vidSpark'), v.sparkline, '#4fb3bf');
+      drawSpark($('audSpark'), a.sparkline, '#e8a838');
+      break;
+    }
+
+    case 'command_result': {
+      commandHistory.unshift(msg);
+      if (commandHistory.length > 50) commandHistory.pop();
+      renderCommandLog();
+      break;
+    }
+  }
+}
+
+const commandHistory = [];
+
+function renderCommandLog() {
+  if (!commandHistory.length) return;
+  els.cmdLog.innerHTML = commandHistory.map(entry => {
+    const cls = entry.ok ? 'ok' : 'bad';
+    const time = new Date(entry.sent_at * 1000).toLocaleTimeString();
+    const detail = entry.ok
+      ? `round trip ${entry.round_trip_ms} ms &middot; phone: ${escapeHtml(entry.response?.note ?? entry.response?.status ?? 'ok')}`
+      : `round trip ${entry.round_trip_ms} ms &middot; ${escapeHtml(entry.error ?? 'failed')}`;
+    return `<li>
+      <div class="cmd-log-main">
+        <span class="badge ${cls}" style="text-transform:none;">${entry.ok ? 'ack' : 'error'}</span>
+        <span><b>${escapeHtml(entry.cmd)}</b> <span class="addr">hub=${escapeHtml(entry.hub)} args=${escapeHtml(JSON.stringify(entry.args))}</span></span>
+        <span class="cmd-log-time">${time}</span>
+      </div>
+      <div class="cmd-log-detail">${detail}</div>
+    </li>`;
+  }).join('');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ---- websocket to our own server.py ----
+let ws;
+function connectWs() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
+  ws.onclose = () => setTimeout(connectWs, 1500);
+}
+connectWs();
+
+// ---- initial state on load (in case something is already connected) ----
+fetch('/api/status').then(r => r.json()).then(s => {
+  if (s.phone_ip) {
+    els.connSub.textContent = `phone ${s.phone_ip}`;
+    els.connDot.className = 'dot ' + (s.media_connected ? 'live' : 'warn');
+    $('ipInput').value = s.phone_ip;
+  }
+  if (s.last_video_b64) {
+    els.cameraImg.src = 'data:image/jpeg;base64,' + s.last_video_b64;
+    els.cameraFrame.classList.add('has-frame');
+  }
+  if (s.last_health) handleMessage({ type: 'health', ok: s.health_ok, data: s.last_health, ts: Date.now() / 1000 });
+  if (s.last_ble) handleMessage({ type: 'ble', ok: true, data: s.last_ble, ts: Date.now() / 1000 });
+  if (s.command_history && s.command_history.length) {
+    commandHistory.push(...s.command_history);
+    renderCommandLog();
+  }
+}).catch(() => {});
+
+// ---- connect / disconnect controls ----
+$('connectForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const ip = $('ipInput').value.trim();
+  if (!ip) return;
+  els.connDot.className = 'dot warn';
+  els.connSub.textContent = `connecting to ${ip}…`;
+  await fetch('/api/connect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ip }),
+  });
+});
+
+$('disconnectBtn').addEventListener('click', async () => {
+  await fetch('/api/disconnect', { method: 'POST' });
+  els.connDot.className = 'dot off';
+  els.connSub.textContent = 'not connected';
+  els.cameraFrame.classList.remove('has-frame');
+  setBadge(els.camBadge, 'no signal', '');
+  setBadge(els.micBadge, 'no signal', '');
+});
+
+$('cmdForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const cmd = $('cmdName').value.trim();
+  if (!cmd) return;
+  let args = {};
+  try {
+    args = JSON.parse($('cmdArgs').value || '{}');
+  } catch (err) {
+    alert('args must be valid JSON, e.g. {"speed": 0.4}');
+    return;
+  }
+  const hub = $('cmdHub').value;
+  try {
+    const resp = await fetch('/api/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cmd, args, hub }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      alert(err.message || `request failed (${resp.status})`);
+    }
+    // rendering happens via the 'command_result' broadcast on /ws
+  } catch (err) {
+    alert(`request failed: ${err}`);
+  }
+});
+
+window.addEventListener('resize', () => {
+  // sparklines redraw on next data tick; just clear the stale width cache
+  ['micSpark', 'vidSpark', 'audSpark'].forEach(id => { $(id).width = 0; });
+});
+</script>
+</body>
+</html>

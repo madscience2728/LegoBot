@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        NoActionBar because this screen has never had one (activity_main.xml
+        was already a bare full-screen view) — explicit now instead of
+        relying on nothing having asked for one yet.
+
+        Transparent status/nav bar colors are what actually fix the
+        "overrides my gesture nav" complaint: the previous default theme
+        left the system nav bar opaque, so on a gesture-nav phone it drew
+        as a separate visible strip instead of getting out of the way.
+        Combined with MainActivity's edge-to-edge window setup, the app's
+        own OLED-black background now shows straight through where that
+        strip used to be — the gesture pill floats on black instead of
+        on a bar.
+    -->
+    <style name="Theme.LegoBotProbe" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:windowBackground">@color/oled_black</item>
+        <item name="android:colorBackground">@color/oled_black</item>
+        <item name="colorPrimary">@color/accent_amber</item>
+        <item name="colorAccent">@color/accent_amber</item>
+
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+
+        <!-- Don't let the OS's own force-dark heuristics touch this —
+             the theme is already deliberately OLED black. -->
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+</resources>

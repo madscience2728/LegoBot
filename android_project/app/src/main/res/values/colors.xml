@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- True black, not dark-gray — this is an OLED panel, so black
+         pixels are actually off rather than lit-and-dim. -->
+    <color name="oled_black">#000000</color>
+
+    <!-- Console gets a hair of lift off pure black so its edge is
+         visible against the background without ever looking gray. -->
+    <color name="oled_console_bg">#0A0A0A</color>
+    <color name="console_divider">#1A1A1A</color>
+    <color name="console_text">#C9CCD1</color>
+    <color name="console_text_dim">#6B6F76</color>
+
+    <color name="text_dim">#6B6F76</color>
+
+    <!-- Same amber used as the accent in the PC dashboard (gui/style.css)
+         so the phone app and the PC GUI read as one product. -->
+    <color name="accent_amber">#E8A838</color>
+</resources>

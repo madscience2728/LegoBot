@@ -1,15 +1,80 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/rootLayout"
     android:layout_width="match_parent"
-    android:layout_height="match_parent">
+    android:layout_height="match_parent"
+    android:background="@color/oled_black">
 
+    <!-- IP address, front and center at the top — this is the thing
+         you glance at to type into the PC dashboard's Connect field. -->
     <TextView
-        android:id="@+id/statusText"
+        android:id="@+id/ipText"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:padding="24dp"
-        android:textSize="16sp"
-        android:textIsSelectable="true"
-        android:text="Requesting permissions..." />
+        android:layout_alignParentTop="true"
+        android:gravity="center"
+        android:fontFamily="monospace"
+        android:textColor="@android:color/white"
+        android:textSize="26sp"
+        android:letterSpacing="0.03"
+        android:paddingTop="16dp"
+        android:paddingBottom="10dp"
+        android:paddingHorizontal="16dp"
+        android:text="connecting…" />
 
-</ScrollView>
+    <!-- Bottom console: fixed-height scrolling log of received commands
+         and (later) robot state. Pinned first so the emoji below can
+         center itself in whatever space is left between this and the
+         IP header. -->
+    <LinearLayout
+        android:id="@+id/consoleContainer"
+        android:layout_width="match_parent"
+        android:layout_height="375dp"
+        android:layout_alignParentBottom="true"
+        android:orientation="vertical"
+        android:background="@color/oled_console_bg">
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="@color/console_divider" />
+
+        <ScrollView
+            android:id="@+id/consoleScroll"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:scrollbars="none"
+            android:paddingHorizontal="12dp"
+            android:paddingVertical="8dp">
+
+            <TextView
+                android:id="@+id/consoleText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="monospace"
+                android:textSize="11sp"
+                android:textColor="@color/console_text"
+                android:lineSpacingExtra="3dp"
+                android:text="" />
+        </ScrollView>
+    </LinearLayout>
+
+    <!-- Placeholder face. RelativeLayout centers a view that has both
+         layout_above and layout_below constraints automatically — no
+         explicit layout_centerVertical needed (and adding one would
+         override this and center in the full screen instead, ignoring
+         the console). Future: something calls setFace() with a
+         real expression as the robot's state changes. -->
+    <TextView
+        android:id="@+id/emojiFace"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_below="@id/ipText"
+        android:layout_above="@id/consoleContainer"
+        android:layout_centerHorizontal="true"
+        android:textSize="160sp"
+        android:contentDescription="LegoBot status face (placeholder)"
+        android:text="🤖" />
+
+</RelativeLayout>

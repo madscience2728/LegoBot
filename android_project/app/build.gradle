@@ -43,9 +43,15 @@ dependencies {
     implementation 'androidx.activity:activity-ktx:1.9.0'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
 
-    // Tiny embedded HTTP server -- this is the "realtime server" piece.
-    // NanoHTTPD's own thread model is enough to prove request/response
-    // + basic streaming; swap for Ktor later if you need WebSockets to
-    // match lego_pi's media_relay.py wire format.
+    // Tiny embedded HTTP server for the probe endpoints from the earlier
+    // phase (/health, /ble/scan, /cam/test, /mic/test) -- plain
+    // request/response, no streaming.
     implementation 'org.nanohttpd:nanohttpd:2.3.1'
+
+    // Ktor: the actual realtime piece. CIO engine (pure Kotlin, no
+    // native Netty deps) hosting a WebSocket server that matches
+    // lego_pi/media_relay.py's wire protocol exactly.
+    implementation 'io.ktor:ktor-server-core:2.3.12'
+    implementation 'io.ktor:ktor-server-cio:2.3.12'
+    implementation 'io.ktor:ktor-server-websockets:2.3.12'
 }

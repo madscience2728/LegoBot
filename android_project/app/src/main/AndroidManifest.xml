@@ -6,6 +6,8 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
 
     <!-- Pre-Android-12 BLE scan permissions. ACCESS_FINE_LOCATION was
          historically required to get BLE scan results at all (BLE
@@ -30,7 +32,7 @@
     <application
         android:allowBackup="false"
         android:label="LegoBot Phone Probe"
-        android:theme="@style/Theme.AppCompat.DayNight">
+        android:theme="@style/Theme.LegoBotProbe">
 
         <activity
             android:name=".MainActivity"
@@ -45,6 +47,11 @@
             android:name=".ProbeService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <service
+            android:name=".relay.MediaRelayService"
+            android:exported="false"
+            android:foregroundServiceType="camera|microphone" />
 
     </application>
 </manifest>
