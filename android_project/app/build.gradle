@@ -1,0 +1,51 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.legobot.phoneprobe'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.legobot.phoneprobe"
+        // S9+ shipped on Android 8.0 (API 26); this floor covers it and
+        // anything it could realistically be upgraded to.
+        minSdk 26
+        // Deliberately NOT 34 -- API 34 makes foreground-service *type*
+        // declarations mandatory per-type (camera/mic/connectedDevice
+        // each need their own manifest entry + runtime checks). 33 keeps
+        // "just prove BLE/cam/mic/server work" simple; revisit once
+        // this is wired to the actual robot and running long-term.
+        targetSdk 33
+        versionCode 1
+        versionName "0.1-probe"
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.activity:activity-ktx:1.9.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
+
+    // Tiny embedded HTTP server -- this is the "realtime server" piece.
+    // NanoHTTPD's own thread model is enough to prove request/response
+    // + basic streaming; swap for Ktor later if you need WebSockets to
+    // match lego_pi's media_relay.py wire format.
+    implementation 'org.nanohttpd:nanohttpd:2.3.1'
+}
