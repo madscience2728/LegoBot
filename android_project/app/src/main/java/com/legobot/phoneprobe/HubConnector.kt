@@ -12,8 +12,11 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.bluetooth.BluetoothStatusCodes
+import android.os.Build
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 
@@ -57,6 +60,18 @@ class HubConnector(private val context: Context, val hubName: String, val label:
         private set
 
     private var gatt: BluetoothGatt? = null
+    private var hubChar: BluetoothGattCharacteristic? = null
+
+    // Single-outstanding-request bookkeeping for sendAndAwait(). Fine to
+    // have only one slot: every LWP command this class currently sends
+    // (describePort's mode-by-mode walk, setLedRgb) is awaited to
+    // completion before the next one is issued -- see each function's own
+    // sequential suspend calls. Guarded by pendingLock because writes are
+    // completed from onCharacteristicChanged, which runs on the BLE
+    // callback thread, not the caller's coroutine.
+    private val pendingLock = Any()
+    private var pendingExpectedTypes: Set<Int> = emptySet()
+    private var pendingDeferred: CompletableDeferred<ByteArray>? = null
 
     @SuppressLint("MissingPermission") // caller (ProbeService) verifies permissions first
     suspend fun connect(scanTimeoutSeconds: Int = 12): JSONObject {
@@ -147,6 +162,20 @@ class HubConnector(private val context: Context, val hubName: String, val label:
             override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
                 val bytes = characteristic.value ?: return
                 CommandBus.post("[$label] <- ${bytes.joinToString(" ") { "%02x".format(it) }}")
+                // Hand off to whichever sendAndAwait() call is currently
+                // waiting, if this reply's Message Type is one it asked
+                // for. Deliberately NOT unconditional (any reply completes
+                // it) -- e.g. describe_port's per-mode queries and a
+                // concurrent unsolicited message (Hub Attached I/O,
+                // Generic Error) could otherwise complete the wrong wait
+                // with the wrong bytes.
+                val type = Lwp.messageType(bytes)
+                synchronized(pendingLock) {
+                    val deferred = pendingDeferred
+                    if (deferred != null && !deferred.isCompleted && type != null && type in pendingExpectedTypes) {
+                        deferred.complete(bytes)
+                    }
+                }
             }
 
             override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
@@ -170,6 +199,7 @@ class HubConnector(private val context: Context, val hubName: String, val label:
             ?: return fail("hub didn't advertise the LEGO Wireless Protocol service ($LEGO_HUB_SERVICE_UUID) -- wrong device, or check the UUID against LEGO's spec")
         val hubChar = hubService.getCharacteristic(LEGO_HUB_CHARACTERISTIC_UUID)
             ?: return fail("LWP service found but missing its characteristic $LEGO_HUB_CHARACTERISTIC_UUID")
+        this.hubChar = hubChar
 
         // --- 3. subscribe to notifications -- the actual proof of a live
         // two-way link, not just an open GATT connection ---
@@ -199,6 +229,7 @@ class HubConnector(private val context: Context, val hubName: String, val label:
         gatt?.disconnect()
         gatt?.close()
         gatt = null
+        hubChar = null
         if (wasConnected) CommandBus.post("[$label] disconnected")
         state = HubConnState.DISCONNECTED
     }
@@ -218,9 +249,136 @@ class HubConnector(private val context: Context, val hubName: String, val label:
         gatt?.disconnect()
         gatt?.close()
         gatt = null
+        hubChar = null
         state = HubConnState.ERROR
         lastError = message
         CommandBus.post("[$label] x $message")
         return statusJson()
+    }
+
+    // -- LWP commands ----------------------------------------------------
+    //
+    // Everything below is the "stage after this one" the class doc
+    // mentions: real Port Output/Information Request messages, not just
+    // proving the notify subscription works. Two commands for now,
+    // matching hub_controller.py's oldest/simplest pair:
+    //   - describePort: read-only diagnostic (Port Information + Port
+    //     Mode Information requests), safe to call any time.
+    //   - setLedRgb: the first real *output* command, deliberately picked
+    //     as the first one to ship because success is visible on the hub
+    //     itself (the LED changes color) rather than only in a log line --
+    //     the same "don't take delivery on faith" reasoning as
+    //     HubConnState.SUBSCRIBING existing as a distinct step from
+    //     CONNECTING above.
+
+    @SuppressLint("MissingPermission") // caller (ProbeService) verifies permissions first
+    private fun writeToHub(bytes: ByteArray): Boolean {
+        val g = gatt ?: return false
+        val char = hubChar ?: return false
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            g.writeCharacteristic(char, bytes, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) ==
+                BluetoothStatusCodes.SUCCESS
+        } else {
+            @Suppress("DEPRECATION") // pre-API33 write path -- minSdk 26 needs this
+            char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            @Suppress("DEPRECATION")
+            char.value = bytes
+            @Suppress("DEPRECATION")
+            g.writeCharacteristic(char)
+        }
+    }
+
+    /** Writes an LWP message and waits for the next notification whose
+     * Message Type is one of expectedTypes. Returns null on write
+     * failure or timeout -- callers turn that into a proper error JSON
+     * rather than throwing, same style as connect()'s own fail() calls. */
+    private suspend fun sendAndAwait(message: ByteArray, expectedTypes: Set<Int>, timeoutMs: Long): ByteArray? {
+        val deferred = CompletableDeferred<ByteArray>()
+        synchronized(pendingLock) {
+            pendingExpectedTypes = expectedTypes
+            pendingDeferred = deferred
+        }
+        if (!writeToHub(message)) {
+            synchronized(pendingLock) { if (pendingDeferred === deferred) pendingDeferred = null }
+            return null
+        }
+        val result = withTimeoutOrNull(timeoutMs) { deferred.await() }
+        synchronized(pendingLock) { if (pendingDeferred === deferred) pendingDeferred = null }
+        return result
+    }
+
+    /** Port A-D diagnostic -- queries the LIVE device for its actual mode
+     * table (name + raw range per mode), same purpose as
+     * hub_controller.py's describe_port: ground truth about what a mode
+     * actually looks like on the wire, instead of assuming. Two BLE
+     * round-trips per mode (NAME, then RAW) plus one to enumerate modes
+     * at all, so this is meant for occasional diagnostic use, not a hot
+     * path -- same tradeoff the old describe_port's docstring called out
+     * against pylgbst's brute-force describe_possible_modes(). */
+    suspend fun describePort(port: String): JSONObject {
+        val out = JSONObject()
+        if (state != HubConnState.CONNECTED) {
+            return out.put("status", "error").put("message", "hub not connected")
+        }
+        val portId = Lwp.PORTS[port.uppercase()]
+            ?: return out.put("status", "error")
+                .put("message", "unknown port '$port', expected one of ${Lwp.PORTS.keys.sorted()}")
+
+        val infoBytes = sendAndAwait(Lwp.portInformationRequest(portId), setOf(Lwp.MSG_PORT_INFORMATION), 3000)
+            ?: return out.put("status", "error")
+                .put("message", "no reply to Port Information Request on port $port -- nothing attached there?")
+        val info = Lwp.parsePortInformationModeInfo(infoBytes)
+            ?: return out.put("status", "error").put("message", "malformed Port Information reply")
+
+        val modesOut = JSONArray()
+        val presentModes = info.inputModes or info.outputModes
+        for (mode in 0 until info.totalModeCount) {
+            if ((presentModes shr mode) and 1 == 0) continue // mode number reserved/unused on this device
+
+            val nameBytes = sendAndAwait(
+                Lwp.portModeInformationRequest(portId, mode, Lwp.MODE_INFO_NAME),
+                setOf(Lwp.MSG_PORT_MODE_INFORMATION), 2000,
+            )
+            val rawBytes = sendAndAwait(
+                Lwp.portModeInformationRequest(portId, mode, Lwp.MODE_INFO_RAW),
+                setOf(Lwp.MSG_PORT_MODE_INFORMATION), 2000,
+            )
+
+            val modeOut = JSONObject()
+            modeOut.put("mode", mode)
+            modeOut.put("name", nameBytes?.let { Lwp.parseModeName(it) } ?: JSONObject.NULL)
+            Lwp.parseModeRawRange(rawBytes ?: ByteArray(0))?.let { (min, max) ->
+                modeOut.put("raw_min", min).put("raw_max", max)
+            }
+            modeOut.put("input", (info.inputModes shr mode) and 1 == 1)
+            modeOut.put("output", (info.outputModes shr mode) and 1 == 1)
+            modesOut.put(modeOut)
+        }
+
+        CommandBus.post("[$label] describe_port $port -> ${modesOut.length()} mode(s) of ${info.totalModeCount} total")
+        return out.put("status", "ok")
+            .put("port", port.uppercase())
+            .put("port_id", portId)
+            .put("total_mode_count", info.totalModeCount)
+            .put("modes", modesOut)
+    }
+
+    /** Sets the hub's own status LED to an exact R/G/B color -- the first
+     * real Port Output Command this class sends. Success here means the
+     * BLE write completed; it does NOT yet wait for the Port Output
+     * Command Feedback (0x82) reply the EXECUTE_IMMEDIATE_WITH_FEEDBACK
+     * flag requests -- that's the natural next step once feedback parsing
+     * is worth adding, but seeing the hub's actual LED change color is
+     * proof enough for this first pass. */
+    suspend fun setLedRgb(r: Int, g: Int, b: Int): JSONObject {
+        val out = JSONObject()
+        if (state != HubConnState.CONNECTED) {
+            return out.put("status", "error").put("message", "hub not connected")
+        }
+        if (!writeToHub(Lwp.setHubLedRgb(r, g, b))) {
+            return out.put("status", "error").put("message", "BLE write failed")
+        }
+        CommandBus.post("[$label] LED -> rgb($r, $g, $b)")
+        return out.put("status", "ok").put("port", "LED").put("r", r).put("g", g).put("b", b)
     }
 }

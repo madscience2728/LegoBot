@@ -46,7 +46,10 @@ class ProbeService : Service() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
         server = ProbeServer(applicationContext).also { it.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false) }
-        CommandBus.post("probe :$PORT ready — /health /ble/scan /cam/test /mic/test /command /hub/connect /hub/disconnect /hub/status")
+        CommandBus.post(
+            "probe :$PORT ready — /health /ble/scan /cam/test /mic/test /command /hub/connect " +
+                "/hub/disconnect /hub/status /hub/describe_port /hub/led"
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -139,6 +142,8 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
                 "/hub/connect" -> hubConnect(session)
                 "/hub/disconnect" -> hubDisconnect(session)
                 "/hub/status" -> hubStatus()
+                "/hub/describe_port" -> hubDescribePort(session)
+                "/hub/led" -> hubLed(session)
                 else -> JSONObject().put("status", "error").put("message", "No such endpoint: ${session.uri}")
             }
         } catch (e: Exception) {
@@ -273,6 +278,50 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
         hubs.forEach { (key, connector) -> hubsOut.put(key, connector.statusJson()) }
         out.put("hubs", hubsOut)
         return out
+    }
+
+    /** First of the two "actually talk LWP to the hub" commands -- see
+     * HubConnector.describePort. Blocking/POST for the same reason
+     * hubConnect is: several BLE round-trips (one per port mode), not a
+     * single fire-and-forget write. */
+    private fun hubDescribePort(session: IHTTPSession): JSONObject {
+        if (session.method != Method.POST) {
+            return JSONObject().put("status", "error").put("message", "/hub/describe_port requires POST")
+        }
+        val files = HashMap<String, String>()
+        session.parseBody(files)
+        val body = JSONObject(files["postData"] ?: "{}")
+        val hubKey = body.optString("hub", "").lowercase()
+        val port = body.optString("port", "")
+
+        val connector = hubs[hubKey]
+            ?: return JSONObject().put("status", "error")
+                .put("message", "unknown hub '$hubKey', expected one of ${hubs.keys.sorted()}")
+
+        return runBlocking { connector.describePort(port) }
+    }
+
+    /** Second of the two "actually talk LWP to the hub" commands -- see
+     * HubConnector.setLedRgb. This is the one whose success is visible on
+     * the hub itself (the LED changes color), not just in a log line --
+     * the whole reason it was picked as the first real *output* command. */
+    private fun hubLed(session: IHTTPSession): JSONObject {
+        if (session.method != Method.POST) {
+            return JSONObject().put("status", "error").put("message", "/hub/led requires POST")
+        }
+        val files = HashMap<String, String>()
+        session.parseBody(files)
+        val body = JSONObject(files["postData"] ?: "{}")
+        val hubKey = body.optString("hub", "").lowercase()
+
+        val connector = hubs[hubKey]
+            ?: return JSONObject().put("status", "error")
+                .put("message", "unknown hub '$hubKey', expected one of ${hubs.keys.sorted()}")
+
+        val r = body.optInt("r", 0)
+        val g = body.optInt("g", 0)
+        val b = body.optInt("b", 0)
+        return runBlocking { connector.setLedRgb(r, g, b) }
     }
 
     private fun intParam(session: IHTTPSession, name: String, default: Int): Int {
