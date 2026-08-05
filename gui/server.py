@@ -823,6 +823,68 @@ async def api_drive(payload: dict):
     return result
 
 
+@app.post("/api/voice/say")
+async def api_voice_say(payload: dict):
+    """Proxies to the phone's /voice/say (see ProbeService.kt's voiceSay
+    / VoiceController.kt) -- local TTS on the phone itself, not audio
+    streamed from here. Fast, like /api/face/set: the phone's speak()
+    only blocks until the engine has accepted the utterance, not until
+    it's finished being said, so this doesn't need the generous timeout
+    /api/hub/connect or /api/hub/describe_port need."""
+    if not state.phone_ip:
+        return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
+
+    text = str((payload or {}).get("text", "")).strip()
+    if not text:
+        return JSONResponse({"status": "error", "message": "provide 'text'."}, status_code=400)
+    interrupt = bool((payload or {}).get("interrupt", True))
+
+    url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/voice/say"
+    try:
+        resp = await asyncio.to_thread(requests.post, url, json={"text": text, "interrupt": interrupt}, timeout=8)
+        data = resp.json()
+    except Exception as exc:
+        data = {"status": "error", "message": str(exc)}
+
+    await broadcast({"type": "voice_result", "text": text, "interrupt": interrupt, "data": data})
+    return data
+
+
+@app.post("/api/voice/stop")
+async def api_voice_stop():
+    """Stops whatever's currently being said, without starting anything
+    new -- distinct from /api/voice/say with interrupt=true, which
+    stops-and-replaces."""
+    if not state.phone_ip:
+        return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
+
+    url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/voice/stop"
+    try:
+        resp = await asyncio.to_thread(requests.post, url, json={}, timeout=8)
+        data = resp.json()
+    except Exception as exc:
+        data = {"status": "error", "message": str(exc)}
+
+    await broadcast({"type": "voice_result", "text": None, "data": data})
+    return data
+
+
+@app.get("/api/voice/status")
+async def api_voice_status():
+    """Read-only -- engine ready/speaking state, for showing the Voice
+    panel's status without needing to have caught the last /voice/say's
+    broadcast (e.g. a freshly-loaded tab)."""
+    if not state.phone_ip:
+        return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
+
+    url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/voice/status"
+    try:
+        resp = await asyncio.to_thread(requests.get, url, timeout=8)
+        return resp.json()
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=502)
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()

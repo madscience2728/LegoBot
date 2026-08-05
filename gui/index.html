@@ -82,6 +82,21 @@
       </div>
     </section>
 
+    <!-- VOICE -->
+    <section class="panel p-voice">
+      <h2>Voice <span class="badge" id="voiceBadge">--</span></h2>
+      <div class="hub-controls">
+        <input type="text" class="face-emoji-input" id="voiceTextInput" placeholder="what should it say?" style="flex:1;">
+        <label class="hub-controls-label" style="display:flex;align-items:center;gap:4px;">
+          <input type="checkbox" id="voiceInterruptCheck" checked style="width:auto;">interrupt
+        </label>
+        <button type="button" class="btn-disconnect" id="voiceSayBtn">Say</button>
+        <button type="button" class="btn-disconnect" id="voiceStopBtn">Stop</button>
+      </div>
+      <div class="hub-extra" id="voiceResult"></div>
+      <div class="timing-note">Local TTS on the phone (VoiceController.kt/Android's TextToSpeech) -- not audio streamed from here. interrupt=true (default) cuts off whatever's currently being said; uncheck to queue instead. This is the same control surface a future LLM's "say something" tool call will use.</div>
+    </section>
+
     <!-- HEALTH -->
     <section class="panel p-health">
       <h2>Health <span class="badge" id="healthBadge">--</span></h2>
@@ -328,6 +343,7 @@ const els = {
   cmdBadge: $('cmdBadge'), cmdLog: $('cmdLog'),
   hubsBadge: $('hubsBadge'),
   faceBadge: $('faceBadge'), faceDisplay: $('faceDisplay'), faceExprSelect: $('faceExprSelect'),
+  voiceBadge: $('voiceBadge'),
 };
 
 // ---- sparkline helper (plain canvas, no deps) ----
@@ -482,6 +498,11 @@ function handleMessage(msg) {
       break;
     }
 
+    case 'voice_result': {
+      renderVoiceResult(msg);
+      break;
+    }
+
     case 'drive_result': {
       renderDriveResult(msg);
       break;
@@ -579,6 +600,34 @@ function renderFaceStatus(data) {
   setBadge(els.faceBadge, 'live', 'ok');
 }
 
+function renderVoiceStatus(data) {
+  if (data.status !== 'ok') {
+    setBadge(els.voiceBadge, 'error', 'bad');
+    return;
+  }
+  if (!data.engine_ready) {
+    setBadge(els.voiceBadge, 'not ready', 'pending');
+  } else if (data.speaking) {
+    setBadge(els.voiceBadge, 'speaking…', 'pending');
+  } else {
+    setBadge(els.voiceBadge, 'ready', 'ok');
+  }
+}
+
+function renderVoiceResult(msg) {
+  const el = $('voiceResult');
+  if (!el) return;
+  const time = new Date().toLocaleTimeString();
+  const ok = msg.data && msg.data.status === 'ok';
+  const label = msg.text ? `"${msg.text}"` : 'stop';
+  const detail = ok ? 'ok' : escapeHtml((msg.data && msg.data.message) ?? 'failed');
+  el.innerHTML = `<div class="${ok ? '' : 'hub-extra-err'}">[${time}] ${escapeHtml(label)} &mdash; ${detail}</div>` + el.innerHTML;
+  // Ask the phone what it's actually doing now rather than guessing from
+  // this one result -- the engine's "speaking" state can change on its
+  // own (an utterance finishing) between voice_result broadcasts.
+  refreshVoiceStatus();
+}
+
 function renderDriveResult(msg) {
   const el = $('driveResult');
   if (!el) return;
@@ -658,6 +707,13 @@ async function refreshFaceStatus() {
   } catch (e) { /* phone not reachable yet -- leave face as-is */ }
 }
 
+async function refreshVoiceStatus() {
+  try {
+    const resp = await fetch('/api/voice/status');
+    if (resp.ok) renderVoiceStatus(await resp.json());
+  } catch (e) { /* phone not reachable yet -- leave badge as-is */ }
+}
+
 fetch('/api/status').then(r => r.json()).then(s => {
   if (s.phone_ip) {
     els.connSub.textContent = `phone ${s.phone_ip}`;
@@ -684,6 +740,7 @@ fetch('/api/status').then(r => r.json()).then(s => {
     // read on hub state rather than relying on the cache above.
     refreshHubStatus();
     refreshFaceStatus();
+    refreshVoiceStatus();
   } else if (storedIp) {
     // Not connected yet, but we remember an IP from last time --
     // reconnect automatically instead of making the person retype it.
@@ -743,6 +800,7 @@ $('connectForm').addEventListener('submit', async (e) => {
   });
   refreshHubStatus();
   refreshFaceStatus();
+  refreshVoiceStatus();
 });
 
 $('disconnectBtn').addEventListener('click', async () => {
@@ -939,6 +997,44 @@ $('faceEmojiBtn').addEventListener('click', async () => {
     const data = await resp.json();
     if (!resp.ok) alert(data.message || `request failed (${resp.status})`);
     // rendering happens via the 'face_status' broadcast on /ws
+  } catch (err) {
+    alert(`request failed: ${err}`);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// ---- voice panel ----
+$('voiceSayBtn').addEventListener('click', async () => {
+  const text = $('voiceTextInput').value.trim();
+  if (!text) return;
+  const interrupt = $('voiceInterruptCheck').checked;
+  const btn = $('voiceSayBtn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/voice/say', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, interrupt }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) alert(data.message || `request failed (${resp.status})`);
+    // rendering happens via the 'voice_result' broadcast on /ws
+  } catch (err) {
+    alert(`request failed: ${err}`);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('voiceStopBtn').addEventListener('click', async () => {
+  const btn = $('voiceStopBtn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/voice/stop', { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) alert(data.message || `request failed (${resp.status})`);
+    // rendering happens via the 'voice_result' broadcast on /ws
   } catch (err) {
     alert(`request failed: ${err}`);
   } finally {

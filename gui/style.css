@@ -173,6 +173,7 @@ button:active { filter: brightness(0.9); }
 .p-timing { grid-column: span 3; }
 .p-wheels { grid-column: span 12; }
 .p-face { grid-column: span 12; }
+.p-voice { grid-column: span 12; }
 .p-drive { grid-column: span 12; }
 .p-command { grid-column: span 12; }
 

@@ -52,7 +52,7 @@ class ProbeService : Service() {
         CommandBus.post(
             "probe :$PORT ready — /health /ble/scan /cam/test /mic/test /command /hub/connect " +
                 "/hub/disconnect /hub/status /hub/describe_port /hub/led /part/set_speed /part/stop " +
-                "/face/set /face/status /drive"
+                "/face/set /face/status /drive /voice/say /voice/stop /voice/status"
         )
     }
 
@@ -139,6 +139,13 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
     // rides on.
     private val driveController = DriveController(hubs)
 
+    // Local TTS -- deliberately not tied to any hub/BLE state, so voice
+    // works even if neither hub is connected (e.g. testing the LLM
+    // layer's "say something" tool calls before the robot itself is
+    // wired up). See VoiceController's own doc for why this isn't a
+    // Bus like FaceBus/CommandBus.
+    private val voiceController = VoiceController(context)
+
     override fun serve(session: IHTTPSession): Response {
         val result: JSONObject = try {
             when (session.uri.trimEnd('/')) {
@@ -158,6 +165,9 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
                 "/face/set" -> faceSet(session)
                 "/face/status" -> faceStatus()
                 "/drive" -> drive(session)
+                "/voice/say" -> voiceSay(session)
+                "/voice/stop" -> voiceStop()
+                "/voice/status" -> voiceController.statusJson()
                 else -> JSONObject().put("status", "error").put("message", "No such endpoint: ${session.uri}")
             }
         } catch (e: Exception) {
@@ -530,4 +540,24 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
     private fun intParam(session: IHTTPSession, name: String, default: Int): Int {
         return session.parameters[name]?.firstOrNull()?.toIntOrNull() ?: default
     }
+
+    /** Speaks text via the phone's local TTS engine (see VoiceController).
+     * Synchronous/fast, unlike hubConnect/describePort -- speak() itself
+     * only blocks until the engine has ACCEPTED the utterance, not until
+     * it's finished being said, so this doesn't need runBlocking's usual
+     * "slow diagnostic action" treatment. interrupt (default true) cuts
+     * off whatever's currently playing; pass false to queue instead. */
+    private fun voiceSay(session: IHTTPSession): JSONObject {
+        if (session.method != Method.POST) {
+            return JSONObject().put("status", "error").put("message", "/voice/say requires POST")
+        }
+        val files = HashMap<String, String>()
+        session.parseBody(files)
+        val body = JSONObject(files["postData"] ?: "{}")
+        val text = body.optString("text", "")
+        val interrupt = body.optBoolean("interrupt", true)
+        return voiceController.speak(text, interrupt)
+    }
+
+    private fun voiceStop(): JSONObject = voiceController.stop()
 }
