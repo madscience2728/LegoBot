@@ -91,6 +91,23 @@ class CameraProbe(private val context: Context) {
                 try {
                     val captureRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
                     captureRequest.addTarget(reader.surface)
+                    // Camera2 doesn't auto-rotate JPEG output to match the
+                    // device's natural orientation -- this bakes the
+                    // correction into the JPEG's EXIF orientation tag,
+                    // which browsers respect when rendering an <img> from
+                    // the resulting data URL. Formula is Android's own
+                    // documented one for front-facing cameras
+                    // (developer.android.com/develop/devices/chromeos/learn/camera-orientation):
+                    // rotate clockwise by (sensorOrientation + deviceOrientationDegrees).
+                    // deviceOrientationDegrees is hardcoded 0 (not queried
+                    // at capture time) because MainActivity is now locked
+                    // to portrait in the manifest -- this phone is mounted
+                    // on the robot, never handheld/rotated, so "natural
+                    // orientation" is a guaranteed invariant here, not an
+                    // assumption that could go stale.
+                    val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+                    val jpegOrientation = (sensorOrientation + 0) % 360
+                    captureRequest.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation)
 
                     camera.createCaptureSession(
                         listOf(reader.surface),

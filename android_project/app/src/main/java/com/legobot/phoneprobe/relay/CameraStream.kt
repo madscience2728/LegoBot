@@ -42,6 +42,16 @@ class CameraStream(private val context: Context) {
     private var handler: Handler? = null
     private var lastEmitMs = 0L
 
+    // How many degrees clockwise the raw sensor frame needs rotating to
+    // appear upright -- see start()'s computation of this. Unlike
+    // CameraProbe.kt's single JPEG capture (which can lean on Camera2's
+    // built-in JPEG_ORIENTATION/EXIF mechanism), this class hand-builds
+    // JPEGs from raw YUV via YuvImage.compressToJpeg(), which has no
+    // orientation support at all -- whatever pixels go in come out
+    // exactly as given, so the rotation has to be applied to the actual
+    // pixel data ourselves (see rotateNv21 below).
+    private var rotationDegrees = 0
+
     @SuppressLint("MissingPermission") // caller verifies CAMERA permission first
     fun start() {
         val ht = HandlerThread("CameraStreamThread").also { it.start() }
@@ -54,6 +64,18 @@ class CameraStream(private val context: Context) {
             manager.getCameraCharacteristics(id)
                 .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
         } ?: manager.cameraIdList.firstOrNull() ?: return
+
+        // Same formula as CameraProbe.kt's JPEG_ORIENTATION computation
+        // (Android's documented front-camera formula, degenerate/equal to
+        // the back-camera formula when deviceOrientationDegrees=0, which
+        // it always is here -- see CameraProbe.kt's comment for why that's
+        // a guaranteed invariant rather than an assumption). Only
+        // multiples of 90 are handled by rotateNv21 below; anything else
+        // reported by a camera would be unusual hardware and gets clamped
+        // to the nearest 90 rather than silently doing nothing.
+        val sensorOrientation = manager.getCameraCharacteristics(cameraId)
+            .get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        rotationDegrees = ((sensorOrientation % 360) + 360) % 360 / 90 * 90
 
         val size = android.util.Size(640, 480)
         val r = ImageReader.newInstance(size.width, size.height, ImageFormat.YUV_420_888, 2)
@@ -109,10 +131,19 @@ class CameraStream(private val context: Context) {
         if (now - lastEmitMs < MIN_FRAME_INTERVAL_MS) return
         lastEmitMs = now
 
-        val nv21 = yuv420ToNv21(image)
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
+        var nv21 = yuv420ToNv21(image)
+        var width = image.width
+        var height = image.height
+        if (rotationDegrees != 0) {
+            val (rotated, w, h) = rotateNv21(nv21, width, height, rotationDegrees)
+            nv21 = rotated
+            width = w
+            height = h
+        }
+
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
         val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), JPEG_QUALITY, out)
+        yuvImage.compressToJpeg(Rect(0, 0, width, height), JPEG_QUALITY, out)
         MediaHub.emit(TYPE_VIDEO, out.toByteArray())
     }
 
@@ -153,6 +184,52 @@ class CameraStream(private val context: Context) {
             }
         }
         return nv21
+    }
+
+    /** Rotates an NV21 buffer by 90/180/270 degrees CLOCKWISE, returning
+     * the rotated bytes plus the new (possibly swapped) width/height.
+     * Index formulas below were derived from scratch and verified against
+     * numpy's rot90 (documented, unambiguous rotation direction) on
+     * non-square test grids -- worth noting because a commonly-copied
+     * "classic" NV21-rotation snippet that looks superficially similar to
+     * this was checked the same way first and turned out to be wrong
+     * (didn't match ground truth on any of 90/180/270), so this was
+     * re-derived rather than trusted from memory. rotation=0 returns the
+     * input unchanged; anything not a multiple of 90 is the caller's bug
+     * (rotationDegrees above only ever produces 0/90/180/270). */
+    private fun rotateNv21(nv21: ByteArray, width: Int, height: Int, rotation: Int): Triple<ByteArray, Int, Int> {
+        if (rotation == 0) return Triple(nv21, width, height)
+        require(rotation == 90 || rotation == 180 || rotation == 270) { "rotation must be 0/90/180/270, got $rotation" }
+
+        val frameSize = width * height
+        val outWidth = if (rotation == 180) width else height
+        val outHeight = if (rotation == 180) height else width
+        val out = ByteArray(nv21.size)
+
+        fun rotatedIndex(i: Int, j: Int, w: Int, h: Int): Int = when (rotation) {
+            90 -> i * h + (h - 1 - j)
+            180 -> (h - 1 - j) * w + (w - 1 - i)
+            else -> (w - 1 - i) * h + j // 270
+        }
+
+        for (j in 0 until height) {
+            for (i in 0 until width) {
+                out[rotatedIndex(i, j, width, height)] = nv21[j * width + i]
+            }
+        }
+
+        val chromaWidth = width / 2
+        val chromaHeight = height / 2
+        for (j in 0 until chromaHeight) {
+            for (i in 0 until chromaWidth) {
+                val oldOffset = frameSize + (j * chromaWidth + i) * 2
+                val newOffset = frameSize + rotatedIndex(i, j, chromaWidth, chromaHeight) * 2
+                out[newOffset] = nv21[oldOffset]         // V
+                out[newOffset + 1] = nv21[oldOffset + 1] // U
+            }
+        }
+
+        return Triple(out, outWidth, outHeight)
     }
 
     fun stop() {
