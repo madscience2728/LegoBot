@@ -37,8 +37,10 @@ from typing import Optional
 
 import requests
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, field_validator
+from typing import Literal
 import uvicorn
 
 # ---------------------------------------------------------------------------
@@ -56,7 +58,12 @@ TYPE_AUDIO = 0x02
 HEALTH_POLL_SECONDS = 3
 BLE_SCAN_SECONDS = 15          # how often to kick off a new scan
 BLE_SCAN_DURATION = 4          # "seconds" param sent to /ble/scan
-HTTP_TIMEOUT = BLE_SCAN_DURATION + 6
+# The phone now serializes BLE scanning (BleScanLock) so this scan and a
+# hub-connect scan never collide on the one radio -- worst case, this
+# request has to wait out a full hub-connect scan (~12s) before its own
+# BLE_SCAN_DURATION even starts. Timeout needs headroom for that wait,
+# not just the scan itself.
+HTTP_TIMEOUT = 12 + BLE_SCAN_DURATION + 6
 
 AUDIO_BROADCAST_HZ = 10         # throttle mic-level updates sent to browser
 TIMING_BROADCAST_HZ = 2         # how often the timing panel refreshes
@@ -64,6 +71,39 @@ LATENCY_WINDOW = 150            # samples kept for rolling stats
 FPS_WINDOW_SECONDS = 5
 
 STATIC_DIR = Path(__file__).parent
+
+# This dashboard's index.html/style.css change often during active
+# development -- browsers caching a stale copy after a refresh (no hard
+# reload) has already caused at least one confusing "the CSS I just
+# shipped isn't showing up" report. Small dev tool, not worth the
+# complexity of cache-busting filenames; just tell the browser not to
+# cache these two at all.
+_NO_CACHE_HEADERS = {"Cache-Control": "no-store, no-cache, must-revalidate"}
+
+# Same vocabulary as old/src/lego_control/hub_controller.py's COMMANDS
+# dict, and ProbeService.kt's KNOWN_COMMANDS on the phone -- duplicated
+# in all three since Python/Kotlin can't share source here. Nothing
+# executes these yet (no hub attached), this just keeps garbage cmd
+# names from silently round-tripping as "ok" the way a bare dict body
+# used to let them.
+KNOWN_COMMANDS = {
+    "stop", "set_speed", "read_angle", "preset_zero", "describe_port",
+    "read_apos", "home_angle", "set_position", "goto_angle",
+}
+
+
+class CommandRequest(BaseModel):
+    cmd: str
+    args: dict = Field(default_factory=dict)
+    hub: Literal["front", "rear"] = "front"
+
+    @field_validator("cmd")
+    @classmethod
+    def cmd_known(cls, v: str) -> str:
+        v = v.strip()
+        if v not in KNOWN_COMMANDS:
+            raise ValueError(f"unknown cmd {v!r}, expected one of {sorted(KNOWN_COMMANDS)}")
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +163,7 @@ class State:
         self.health_ok: Optional[bool] = None
         self.last_health: Optional[dict] = None
         self.last_ble: Optional[dict] = None
+        self.last_hub_status: Optional[dict] = None
         self.last_video_b64: Optional[str] = None
         self.video_timing = ChannelTiming()
         self.audio_timing = ChannelTiming()
@@ -329,12 +370,22 @@ async def on_startup():
 # ---------------------------------------------------------------------------
 @app.get("/")
 async def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    # Cache-Control headers alone weren't reliably bypassing a stale
+    # cached style.css in testing (browser/proxy caching a same-URL
+    # resource is notoriously inconsistent about revalidating even with
+    # no-store set). Appending style.css's own mtime as a query string
+    # forces a genuinely different URL every time the file's content
+    # actually changes, which no cache can silently serve around --
+    # self-maintaining, no manual version bump needed on future edits.
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    css_version = int((STATIC_DIR / "style.css").stat().st_mtime)
+    html = html.replace('href="/style.css"', f'href="/style.css?v={css_version}"')
+    return HTMLResponse(html, headers=_NO_CACHE_HEADERS)
 
 
 @app.get("/style.css")
 async def style():
-    return FileResponse(STATIC_DIR / "style.css", media_type="text/css")
+    return FileResponse(STATIC_DIR / "style.css", media_type="text/css", headers=_NO_CACHE_HEADERS)
 
 
 @app.post("/api/connect")
@@ -365,25 +416,32 @@ async def api_status():
         "video_timing": state.video_timing.snapshot(),
         "audio_timing": state.audio_timing.snapshot(),
         "command_history": list(state.command_history),
+        "last_hub_status": state.last_hub_status,
     }
 
 
+@app.get("/api/commands/known")
+async def api_known_commands():
+    return {"commands": sorted(KNOWN_COMMANDS), "hubs": ["front", "rear"]}
+
+
 @app.post("/api/command")
-async def api_command(payload: dict):
+async def api_command(payload: CommandRequest):
     """Proxies a dummy command to the phone's /command endpoint (see
     ProbeService.kt) and times the full round trip from this PC's
     perspective -- complementary to the media-channel latency numbers,
     since this is the channel real robot commands (and later, the LLM
     layer's tool calls) will actually travel over.
+
+    cmd/hub are validated by CommandRequest before this even runs --
+    FastAPI returns a 422 with the allowed values for anything outside
+    the known vocabulary, so a typo'd command never reaches the phone
+    or gets logged as if it were real.
     """
     if not state.phone_ip:
         return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
 
-    cmd = (payload or {}).get("cmd", "").strip()
-    if not cmd:
-        return JSONResponse({"status": "error", "message": "No cmd given."}, status_code=400)
-    args = (payload or {}).get("args") or {}
-    hub = (payload or {}).get("hub") or "front"
+    cmd, args, hub = payload.cmd, payload.args, payload.hub
 
     url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/command"
     sent_at = time.time()
@@ -416,6 +474,91 @@ async def api_command(payload: dict):
     state.command_history.appendleft(result)
     await broadcast(result)
     return result
+
+
+@app.post("/api/hub/connect")
+async def api_hub_connect(payload: dict):
+    """Proxies to the phone's /hub/connect (see HubConnector.kt), which
+    does a real BLE scan + GATT connect + notify-subscribe. This can
+    take up to ~25s on the phone (scan + handshake), so the timeout here
+    is generous -- this is NOT the low-latency dummy /command channel,
+    it's a slow one-shot action, same as /ble/scan already is.
+    """
+    if not state.phone_ip:
+        return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
+
+    hub = (payload or {}).get("hub", "").strip().lower()
+    if hub not in ("front", "rear"):
+        return JSONResponse({"status": "error", "message": "hub must be 'front' or 'rear'."}, status_code=400)
+
+    url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/hub/connect"
+    try:
+        resp = await asyncio.to_thread(requests.post, url, json={"hub": hub}, timeout=35)
+        data = resp.json()
+    except Exception as exc:
+        data = {"status": "error", "message": str(exc)}
+
+    # Fold this hub's result into the cached combined status so /api/status
+    # and freshly-loaded tabs see it without waiting for a /hub/status poll.
+    hub_result = data.get("hub") if isinstance(data.get("hub"), dict) else None
+    if hub_result:
+        state.last_hub_status = state.last_hub_status or {"status": "ok", "hubs": {}}
+        state.last_hub_status.setdefault("hubs", {})[hub] = hub_result
+
+    await broadcast({"type": "hub_status", "hub": hub, "data": data})
+    return data
+
+
+@app.post("/api/hub/disconnect")
+async def api_hub_disconnect(payload: dict):
+    """Plain teardown, no reconnect attempt -- see HubConnector's
+    disconnect() / ProbeService's hubDisconnect() docstrings for why
+    this is a separate endpoint from /hub/connect rather than routing
+    'Reconnect' back through connect()."""
+    if not state.phone_ip:
+        return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
+
+    hub = (payload or {}).get("hub", "").strip().lower()
+    if hub not in ("front", "rear"):
+        return JSONResponse({"status": "error", "message": "hub must be 'front' or 'rear'."}, status_code=400)
+
+    url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/hub/disconnect"
+    try:
+        resp = await asyncio.to_thread(requests.post, url, json={"hub": hub}, timeout=8)
+        data = resp.json()
+    except Exception as exc:
+        data = {"status": "error", "message": str(exc)}
+
+    hub_result = data.get("hub") if isinstance(data.get("hub"), dict) else None
+    if hub_result:
+        state.last_hub_status = state.last_hub_status or {"status": "ok", "hubs": {}}
+        state.last_hub_status.setdefault("hubs", {})[hub] = hub_result
+
+    await broadcast({"type": "hub_status", "hub": hub, "data": data})
+    return data
+
+
+@app.get("/api/hub/status")
+async def api_hub_status():
+    """Non-blocking -- just asks the phone what it already knows, same
+    as the phone's own /hub/status. Safe to poll."""
+    if not state.phone_ip:
+        return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
+
+    url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/hub/status"
+    try:
+        # /hub/status itself is instant on the phone, but the phone's
+        # single request-handling capacity can be under real load from a
+        # concurrent /hub/connect (BLE scan+GATT for the OTHER hub) --
+        # 5s was tight enough to occasionally 502 during that, even
+        # though the phone was healthy and would've answered shortly after.
+        resp = await asyncio.to_thread(requests.get, url, timeout=12)
+        data = resp.json()
+        state.last_hub_status = data
+        await broadcast({"type": "hub_status", "hub": None, "data": data})
+        return data
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=502)
 
 
 @app.websocket("/ws")

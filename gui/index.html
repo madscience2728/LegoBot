@@ -80,6 +80,30 @@
       <div class="timing-note">Probe currently only scans (no GATT connect) &mdash; this is "seen nearby", not "paired".</div>
     </section>
 
+    <!-- HUBS -->
+    <section class="panel p-hubs">
+      <h2>Hubs <span class="badge" id="hubsBadge">0/2 connected</span></h2>
+      <ul class="hub-list" id="hubList">
+        <li class="hub-row" data-hub="front">
+          <div class="hub-row-top">
+            <span class="badge" id="hubBadge-front">unknown</span>
+            <span class="hub-name"><b>front</b> <span class="addr">"Control+ Hub"</span></span>
+            <button type="button" class="btn-disconnect hub-connect-btn" data-hub="front">Connect</button>
+          </div>
+          <div class="hub-detail" id="hubDetail-front"></div>
+        </li>
+        <li class="hub-row" data-hub="rear">
+          <div class="hub-row-top">
+            <span class="badge" id="hubBadge-rear">unknown</span>
+            <span class="hub-name"><b>rear</b> <span class="addr">"Daril"</span></span>
+            <button type="button" class="btn-disconnect hub-connect-btn" data-hub="rear">Connect</button>
+          </div>
+          <div class="hub-detail" id="hubDetail-rear"></div>
+        </li>
+      </ul>
+      <div class="timing-note">Connect does a real BLE scan + GATT handshake on the phone (~10-25s) -- proves the link, doesn't drive any motors yet.</div>
+    </section>
+
     <!-- TIMING -->
     <section class="panel p-timing">
       <h2>Network Timing</h2>
@@ -107,7 +131,7 @@
         <form class="cmd-form" id="cmdForm">
           <div class="cmd-row">
             <label>cmd</label>
-            <input type="text" id="cmdName" placeholder="e.g. set_speed" autocomplete="off">
+            <select id="cmdName"></select>
             <label>hub</label>
             <select id="cmdHub">
               <option value="front">front</option>
@@ -144,6 +168,7 @@ const els = {
   vidTimingNums: $('vidTimingNums'), audTimingNums: $('audTimingNums'),
   vidFpsAge: $('vidFpsAge'), audFpsAge: $('audFpsAge'),
   cmdBadge: $('cmdBadge'), cmdLog: $('cmdLog'),
+  hubsBadge: $('hubsBadge'),
 };
 
 // ---- sparkline helper (plain canvas, no deps) ----
@@ -268,7 +293,39 @@ function handleMessage(msg) {
       renderCommandLog();
       break;
     }
+
+    case 'hub_status': {
+      if (msg.data && msg.data.hubs) {
+        renderHubs(msg.data.hubs);
+      } else if (msg.hub && msg.data && msg.data.hub) {
+        renderHubs({ [msg.hub]: msg.data.hub });
+      }
+      break;
+    }
   }
+}
+
+const hubStates = {}; // persistent cache -- merges partial updates (e.g. a single-hub
+// connect result only reports THAT hub) so the "N/2 connected" badge is always
+// computed from everything known so far, not just the last message received.
+
+function renderHubs(hubs) {
+  Object.assign(hubStates, hubs);
+  for (const [key, h] of Object.entries(hubStates)) {
+    const badge = $(`hubBadge-${key}`);
+    const detail = $(`hubDetail-${key}`);
+    if (!badge) continue;
+    const state = h.state || 'unknown';
+    const cls = state === 'connected' ? 'ok' : (state === 'error' ? 'bad' : (state === 'unknown' ? '' : 'pending'));
+    setBadge(badge, state, cls);
+    if (detail) {
+      detail.textContent = h.error ? h.error : (h.address ? `addr ${h.address}` : '');
+    }
+    const btn = document.querySelector(`.hub-connect-btn[data-hub="${key}"]`);
+    if (btn) btn.textContent = state === 'connected' ? 'Disconnect' : 'Connect';
+  }
+  const totalConnected = Object.values(hubStates).filter(h => h.state === 'connected').length;
+  setBadge(els.hubsBadge, `${totalConnected}/2 connected`, totalConnected === 2 ? 'ok' : '');
 }
 
 const commandHistory = [];
@@ -306,6 +363,24 @@ function connectWs() {
 connectWs();
 
 // ---- initial state on load (in case something is already connected) ----
+const LAST_IP_KEY = 'legobot_last_phone_ip';
+
+async function refreshHubStatus() {
+  // Asks the phone what it already knows (non-blocking on the phone
+  // side) rather than trusting only whatever this GUI server happened
+  // to cache -- the phone's BLE links survive a GUI server restart or a
+  // fresh browser tab, so "unknown" here would otherwise wrongly imply
+  // "not connected" and re-offer a Connect button for a hub that's
+  // already live.
+  try {
+    const resp = await fetch('/api/hub/status');
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.hubs) renderHubs(data.hubs);
+    }
+  } catch (e) { /* phone not reachable yet -- leave badges as-is */ }
+}
+
 fetch('/api/status').then(r => r.json()).then(s => {
   if (s.phone_ip) {
     els.connSub.textContent = `phone ${s.phone_ip}`;
@@ -322,13 +397,60 @@ fetch('/api/status').then(r => r.json()).then(s => {
     commandHistory.push(...s.command_history);
     renderCommandLog();
   }
+  if (s.last_hub_status && s.last_hub_status.hubs) {
+    renderHubs(s.last_hub_status.hubs); // paint cached state immediately
+  }
+
+  const storedIp = localStorage.getItem(LAST_IP_KEY);
+  if (s.phone_ip) {
+    // Already connected (GUI server had a live session) -- get a fresh
+    // read on hub state rather than relying on the cache above.
+    refreshHubStatus();
+  } else if (storedIp) {
+    // Not connected yet, but we remember an IP from last time --
+    // reconnect automatically instead of making the person retype it.
+    $('ipInput').value = storedIp;
+    $('connectForm').requestSubmit();
+  }
 }).catch(() => {});
+
+// ---- known-command vocabulary, mirrors old/src/lego_control/hub_controller.py's
+// COMMANDS dict + ProbeService.kt's KNOWN_COMMANDS. Fetched from the
+// server (single source of truth on the PC side) rather than hardcoded
+// a third time here; the hint args below are just a convenience
+// starting point for each command's usual shape, not validated.
+const ARGS_HINTS = {
+  stop: { port: 'A' },
+  set_speed: { port: 'A', speed: 0.4 },
+  read_angle: { port: 'A' },
+  preset_zero: { port: 'A' },
+  describe_port: { port: 'A' },
+  read_apos: { port: 'A' },
+  home_angle: { port: 'A', target_degrees: 0 },
+  set_position: { port: 'A', target_degrees: 90 },
+  goto_angle: { port: 'A', target_degrees: 90 },
+};
+
+function applyArgsHint() {
+  const hint = ARGS_HINTS[$('cmdName').value];
+  if (hint) $('cmdArgs').value = JSON.stringify(hint);
+}
+
+fetch('/api/commands/known').then(r => r.json()).then(({ commands }) => {
+  const select = $('cmdName');
+  select.innerHTML = commands.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+  select.addEventListener('change', applyArgsHint);
+  applyArgsHint();
+}).catch(() => {
+  $('cmdName').innerHTML = '<option value="">(could not load command list)</option>';
+});
 
 // ---- connect / disconnect controls ----
 $('connectForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const ip = $('ipInput').value.trim();
   if (!ip) return;
+  localStorage.setItem(LAST_IP_KEY, ip);
   els.connDot.className = 'dot warn';
   els.connSub.textContent = `connecting to ${ip}…`;
   await fetch('/api/connect', {
@@ -336,10 +458,12 @@ $('connectForm').addEventListener('submit', async (e) => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ip }),
   });
+  refreshHubStatus();
 });
 
 $('disconnectBtn').addEventListener('click', async () => {
   await fetch('/api/disconnect', { method: 'POST' });
+  localStorage.removeItem(LAST_IP_KEY);
   els.connDot.className = 'dot off';
   els.connSub.textContent = 'not connected';
   els.cameraFrame.classList.remove('has-frame');
@@ -347,9 +471,40 @@ $('disconnectBtn').addEventListener('click', async () => {
   setBadge(els.micBadge, 'no signal', '');
 });
 
+document.querySelectorAll('.hub-connect-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const hub = btn.dataset.hub;
+    // "Reconnect" used to route through /api/hub/connect, which tears
+    // the old link down FIRST and only then tries a fresh one -- if
+    // that fresh attempt failed, the net effect was just a disconnect
+    // with an unrelated error message. Now the button does exactly
+    // what it currently says: disconnect if already connected, connect
+    // otherwise. No silent bait-and-switch.
+    const isConnected = hubStates[hub]?.state === 'connected';
+    const endpoint = isConnected ? '/api/hub/disconnect' : '/api/hub/connect';
+    btn.disabled = true;
+    btn.textContent = isConnected ? 'Disconnecting…' : 'Connecting…';
+    setBadge($(`hubBadge-${hub}`), isConnected ? 'disconnecting…' : 'connecting…', 'pending');
+    try {
+      const resp = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hub }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) alert(data.message || `request failed (${resp.status})`);
+      // rendering happens via the 'hub_status' broadcast on /ws
+    } catch (err) {
+      alert(`request failed: ${err}`);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+});
+
 $('cmdForm').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const cmd = $('cmdName').value.trim();
+  const cmd = $('cmdName').value;
   if (!cmd) return;
   let args = {};
   try {
@@ -367,7 +522,12 @@ $('cmdForm').addEventListener('submit', async (e) => {
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
-      alert(err.message || `request failed (${resp.status})`);
+      // FastAPI validation errors (422) come back as {"detail": [{"msg": ...}, ...]};
+      // our own hand-written errors (400, e.g. "not connected") come back as {"message": ...}.
+      const msg = err.message
+        || (Array.isArray(err.detail) ? err.detail.map(d => d.msg).join('; ') : err.detail)
+        || `request failed (${resp.status})`;
+      alert(msg);
     }
     // rendering happens via the 'command_result' broadcast on /ws
   } catch (err) {

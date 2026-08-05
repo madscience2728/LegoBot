@@ -26,23 +26,29 @@ import org.json.JSONObject
 class BleScanner(private val context: Context) {
 
     @SuppressLint("MissingPermission") // caller (ProbeService) verifies permissions first
-    suspend fun scan(seconds: Int): JSONObject {
+    suspend fun scan(seconds: Int): JSONObject = BleScanLock.withLock {
         val btManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         val adapter = btManager.adapter
-            ?: return errorResult("No Bluetooth adapter on this device.")
+            ?: return@withLock errorResult("No Bluetooth adapter on this device.")
         if (!adapter.isEnabled) {
-            return errorResult("Bluetooth is off -- enable it in the phone's quick settings.")
+            return@withLock errorResult("Bluetooth is off -- enable it in the phone's quick settings.")
         }
         val scanner = adapter.bluetoothLeScanner
-            ?: return errorResult("BluetoothLeScanner unavailable (adapter busy or off).")
+            ?: return@withLock errorResult("BluetoothLeScanner unavailable (adapter busy or off).")
 
         val found = LinkedHashMap<String, ScanResult>() // address -> latest result, de-duped
+        var failureCode: Int? = null
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 found[result.device.address] = result
             }
             override fun onScanFailed(errorCode: Int) {
-                found["__error__"] = null as ScanResult? ?: return
+                // Previously silently discarded (bug) -- a real failure here
+                // (e.g. SCAN_FAILED_ALREADY_STARTED from two scans racing on
+                // the same radio) used to come back looking identical to
+                // "scanned fine, saw nothing," which is exactly the kind of
+                // gap this whole probe stage exists to close.
+                failureCode = errorCode
             }
         }
 
@@ -50,9 +56,12 @@ class BleScanner(private val context: Context) {
         delay(seconds * 1000L)
         scanner.stopScan(callback)
 
+        failureCode?.let { code ->
+            return@withLock errorResult("BLE scan failed: ${scanFailureMessage(code)}")
+        }
+
         val devices = JSONArray()
         for (result in found.values) {
-            if (result == null) continue
             val entry = JSONObject()
             entry.put("address", result.device.address)
             entry.put("name", result.device.name ?: result.scanRecord?.deviceName ?: "(unnamed)")
@@ -65,7 +74,7 @@ class BleScanner(private val context: Context) {
         out.put("scan_seconds", seconds)
         out.put("device_count", devices.length())
         out.put("devices", devices)
-        return out
+        out
     }
 
     private fun errorResult(message: String): JSONObject {
@@ -74,4 +83,16 @@ class BleScanner(private val context: Context) {
         out.put("message", message)
         return out
     }
+}
+
+/** Human-readable text for ScanCallback.SCAN_FAILED_* codes -- the
+ * platform only gives you an int. */
+fun scanFailureMessage(code: Int): String = when (code) {
+    ScanCallback.SCAN_FAILED_ALREADY_STARTED ->
+        "a scan was already running (SCAN_FAILED_ALREADY_STARTED) -- two scans overlapped despite BleScanLock; shouldn't happen, worth a bug report if seen"
+    ScanCallback.SCAN_FAILED_APPLICATION_REGISTRATION_FAILED ->
+        "app registration failed (SCAN_FAILED_APPLICATION_REGISTRATION_FAILED) -- often Android's scan-throttling kicking in after too many start/stop cycles in a short window"
+    ScanCallback.SCAN_FAILED_FEATURE_UNSUPPORTED -> "BLE scanning unsupported on this radio (SCAN_FAILED_FEATURE_UNSUPPORTED)"
+    ScanCallback.SCAN_FAILED_INTERNAL_ERROR -> "internal Bluetooth stack error (SCAN_FAILED_INTERNAL_ERROR) -- toggling Bluetooth off/on often clears this"
+    else -> "unknown error code $code"
 }

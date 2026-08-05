@@ -87,7 +87,7 @@ class MainActivity : AppCompatActivity() {
             insets
         }
 
-        log("probe :8765 ready — /health /ble/scan /cam/test /mic/test /command")
+        log("probe :8765 ready — /health /ble/scan /cam/test /mic/test /command /hub/connect /hub/disconnect /hub/status")
         log("media relay :8001 ready — ws /media")
 
         val missing = requiredPermissions.filter {
