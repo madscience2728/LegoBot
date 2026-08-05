@@ -20,11 +20,14 @@ private const val COMMAND_LOG_CAPACITY = 50
 
 // Same vocabulary as old/src/lego_control/hub_controller.py's COMMANDS
 // dict, and gui/server.py's KNOWN_COMMANDS on the PC -- duplicated in
-// all three since Kotlin/Python can't share source here. Nothing
-// dispatches to a real command yet (no hub attached); this just keeps
-// a typo'd cmd from silently round-tripping as "ok".
+// all three since Kotlin/Python can't share source here.
+//
+// "stop" and "set_speed" now really dispatch to HubConnector (see
+// command() below); the rest still just validate the cmd/hub names and
+// log, so a typo'd cmd never silently round-trips as "ok" while their
+// own dispatch is still unbuilt.
 private val KNOWN_COMMANDS = setOf(
-    "stop", "set_speed", "read_angle", "preset_zero", "describe_port",
+    "stop", "set_speed", "read_angle", "preset_zero",
     "read_apos", "home_angle", "set_position", "goto_angle",
 )
 private val KNOWN_HUBS = setOf("front", "rear")
@@ -48,7 +51,7 @@ class ProbeService : Service() {
         server = ProbeServer(applicationContext).also { it.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false) }
         CommandBus.post(
             "probe :$PORT ready — /health /ble/scan /cam/test /mic/test /command /hub/connect " +
-                "/hub/disconnect /hub/status /hub/describe_port /hub/led"
+                "/hub/disconnect /hub/status /hub/describe_port /hub/led /part/set_speed /part/stop"
         )
     }
 
@@ -144,6 +147,8 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
                 "/hub/status" -> hubStatus()
                 "/hub/describe_port" -> hubDescribePort(session)
                 "/hub/led" -> hubLed(session)
+                "/part/set_speed" -> partSetSpeed(session)
+                "/part/stop" -> partStop(session)
                 else -> JSONObject().put("status", "error").put("message", "No such endpoint: ${session.uri}")
             }
         } catch (e: Exception) {
@@ -162,16 +167,19 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
     }
 
     /**
-     * Dummy command receiver -- same {"cmd", "args", "hub"} body shape as
+     * Command receiver -- same {"cmd", "args", "hub"} body shape as
      * relay_server.py's Command model, POSTed the same way pc_server.py's
      * /command would eventually be told to reach this phone instead of
      * the Pi. Validates cmd/hub against the same vocabulary
-     * hub_controller.py's COMMANDS dict defines, but does NOT dispatch to
-     * it or touch any hardware -- the whole point of this stage is
-     * proving delivery (PC sent it, phone got it, phone answered
-     * sensibly) without the robot in the loop yet. Swapping the body of
-     * the success path for a real dispatch() call later is the only
-     * thing that needs to change.
+     * hub_controller.py's COMMANDS dict defines.
+     *
+     * "stop" and "set_speed" now really dispatch to HubConnector (see
+     * below) -- the first two commands in this vocabulary to graduate
+     * out of the dummy log-only path, same way describe_port/led did by
+     * getting their own dedicated endpoints. Everything else here
+     * (read_angle, preset_zero, read_apos, home_angle, set_position,
+     * goto_angle) still needs encoder-subscription infrastructure this
+     * class doesn't have yet, so those stay logged-only for now.
      */
     private fun command(session: IHTTPSession): JSONObject {
         if (session.method != Method.POST) {
@@ -206,15 +214,40 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
 
         val entry = commandLog.receive(cmd, args, hub, valid = true)
         CommandBus.post("› $cmd  hub=$hub  $args")
-        CommandBus.post("  state: idle — probe stage, no hub attached")
 
+        val connector = hubs[hub]
+            ?: return JSONObject().put("status", "error").put("message", "no HubConnector for hub '$hub'")
+
+        val dispatchResult: JSONObject? = when (cmd) {
+            "stop" -> runBlocking { connector.stop(args.optString("port", "A")) }
+            "set_speed" -> runBlocking {
+                connector.setSpeed(
+                    args.optString("port", "A"),
+                    args.optDouble("speed", 0.0),
+                    args.optBoolean("invert", false),
+                )
+            }
+            else -> null
+        }
+
+        if (dispatchResult != null) {
+            return JSONObject()
+                .put("status", dispatchResult.optString("status", "error"))
+                .put("cmd", cmd)
+                .put("args", args)
+                .put("hub", hub)
+                .put("received_at", entry.get("received_at"))
+                .put("result", dispatchResult)
+        }
+
+        CommandBus.post("  state: idle — probe stage, dispatch not implemented for '$cmd' yet")
         val out = JSONObject()
         out.put("status", "ok")
         out.put("cmd", cmd)
         out.put("args", args)
         out.put("hub", hub)
         out.put("received_at", entry.get("received_at"))
-        out.put("note", "probe stage -- logged only, no hub attached yet")
+        out.put("note", "probe stage -- logged only, dispatch not implemented for '$cmd' yet")
         return out
     }
 
@@ -333,6 +366,53 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
         val g = body.optInt("g", 0)
         val b = body.optInt("b", 0)
         return runBlocking { connector.setLedRgb(r, g, b) }
+    }
+
+    /** Same as /command's set_speed, but addressed by part name (see
+     * WheelMap) instead of the caller needing to know which hub+port
+     * that part is wired to. Applies WheelMap's confirmed invert flag,
+     * so callers of this endpoint always mean "physical direction",
+     * not "raw motor sign" -- the calibration this endpoint was
+     * originally built to support (see WheelMap's doc comment). */
+    private fun partSetSpeed(session: IHTTPSession): JSONObject {
+        if (session.method != Method.POST) {
+            return JSONObject().put("status", "error").put("message", "/part/set_speed requires POST")
+        }
+        val files = HashMap<String, String>()
+        session.parseBody(files)
+        val body = JSONObject(files["postData"] ?: "{}")
+        val part = body.optString("part", "")
+        val wiring = WheelMap.PARTS[part]
+            ?: return JSONObject().put("status", "error")
+                .put("message", "unknown part '$part', expected one of ${WheelMap.PARTS.keys.sorted()}")
+
+        val connector = hubs[wiring.hub]
+            ?: return JSONObject().put("status", "error").put("message", "no HubConnector for hub '${wiring.hub}'")
+
+        val speed = body.optDouble("speed", 0.0)
+        val result = runBlocking { connector.setSpeed(wiring.port, speed, invert = wiring.invert) }
+        return JSONObject().put("status", result.optString("status", "error"))
+            .put("part", part).put("hub", wiring.hub).put("port", wiring.port).put("result", result)
+    }
+
+    private fun partStop(session: IHTTPSession): JSONObject {
+        if (session.method != Method.POST) {
+            return JSONObject().put("status", "error").put("message", "/part/stop requires POST")
+        }
+        val files = HashMap<String, String>()
+        session.parseBody(files)
+        val body = JSONObject(files["postData"] ?: "{}")
+        val part = body.optString("part", "")
+        val wiring = WheelMap.PARTS[part]
+            ?: return JSONObject().put("status", "error")
+                .put("message", "unknown part '$part', expected one of ${WheelMap.PARTS.keys.sorted()}")
+
+        val connector = hubs[wiring.hub]
+            ?: return JSONObject().put("status", "error").put("message", "no HubConnector for hub '${wiring.hub}'")
+
+        val result = runBlocking { connector.stop(wiring.port) }
+        return JSONObject().put("status", result.optString("status", "error"))
+            .put("part", part).put("hub", wiring.hub).put("port", wiring.port).put("result", result)
     }
 
     private fun intParam(session: IHTTPSession, name: String, default: Int): Int {

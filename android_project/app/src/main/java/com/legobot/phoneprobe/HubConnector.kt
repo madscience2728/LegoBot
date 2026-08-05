@@ -408,4 +408,54 @@ class HubConnector(private val context: Context, val hubName: String, val label:
         CommandBus.post("[$label] LED -> rgb($r, $g, $b) [mode 1 -- unconfirmed, may not render]")
         return out.put("status", "ok").put("port", "LED").put("r", r).put("g", g).put("b", b)
     }
+
+    /** Continuous regulated speed on one motor port, -1.0..1.0, runs
+     * until the next stop/command -- same semantics and parameter shape
+     * as hub_controller.py's set_speed(port, speed, invert), just sent
+     * as StartSpeed (0x07) directly instead of through pylgbst.
+     *
+     * invert: some motors are mounted with their physical rotation
+     * direction reversed relative to the software's positive-speed
+     * convention (see the front/rear hub wheel wiring). Rather than
+     * making every caller remember to negate `speed` for those specific
+     * ports, invert=True does it here, once -- same reasoning as the old
+     * Python version's own docstring. */
+    suspend fun setSpeed(port: String, speed: Double, invert: Boolean = false): JSONObject {
+        val out = JSONObject()
+        if (state != HubConnState.CONNECTED) {
+            return out.put("status", "error").put("message", "hub not connected")
+        }
+        val portId = Lwp.PORTS[port.uppercase()]
+            ?: return out.put("status", "error")
+                .put("message", "unknown port '$port', expected one of ${Lwp.PORTS.keys.sorted()}")
+
+        val actualSpeed = if (invert) -speed else speed
+        val speedByte = Lwp.speedToByte(actualSpeed)
+        if (!writeToHub(Lwp.startSpeed(portId, speedByte))) {
+            return out.put("status", "error").put("message", "BLE write failed")
+        }
+        CommandBus.post("[$label] port $port -> speed $speed${if (invert) " (inverted)" else ""}")
+        return out.put("status", "ok").put("port", port.uppercase()).put("speed", speed).put("invert", invert)
+    }
+
+    /** Stops one motor port -- StartSpeedForTime(0ms, endState=BRAKE),
+     * exactly matching pylgbst's Motor.stop() (`self.timed(0)`), not
+     * StartSpeed(0). See Lwp.stopMotor's doc for why that distinction
+     * matters: this is the specific command already proven to stop
+     * these motors on this hardware, not a simplification of it. */
+    suspend fun stop(port: String): JSONObject {
+        val out = JSONObject()
+        if (state != HubConnState.CONNECTED) {
+            return out.put("status", "error").put("message", "hub not connected")
+        }
+        val portId = Lwp.PORTS[port.uppercase()]
+            ?: return out.put("status", "error")
+                .put("message", "unknown port '$port', expected one of ${Lwp.PORTS.keys.sorted()}")
+
+        if (!writeToHub(Lwp.stopMotor(portId))) {
+            return out.put("status", "error").put("message", "BLE write failed")
+        }
+        CommandBus.post("[$label] port $port -> stop (brake)")
+        return out.put("status", "ok").put("port", port.uppercase())
+    }
 }

@@ -434,11 +434,15 @@ async def api_known_commands():
 
 @app.post("/api/command")
 async def api_command(payload: CommandRequest):
-    """Proxies a dummy command to the phone's /command endpoint (see
+    """Proxies a command to the phone's /command endpoint (see
     ProbeService.kt) and times the full round trip from this PC's
     perspective -- complementary to the media-channel latency numbers,
     since this is the channel real robot commands (and later, the LLM
     layer's tool calls) will actually travel over.
+
+    "stop" and "set_speed" now really dispatch to a motor on the phone;
+    the rest of KNOWN_COMMANDS still just log and echo back, same as
+    before, until their own dispatch exists.
 
     cmd/hub are validated by CommandRequest before this even runs --
     FastAPI returns a 422 with the allowed values for anything outside
@@ -488,7 +492,7 @@ async def api_hub_connect(payload: dict):
     """Proxies to the phone's /hub/connect (see HubConnector.kt), which
     does a real BLE scan + GATT connect + notify-subscribe. This can
     take up to ~25s on the phone (scan + handshake), so the timeout here
-    is generous -- this is NOT the low-latency dummy /command channel,
+    is generous -- this is NOT the low-latency /command channel,
     it's a slow one-shot action, same as /ble/scan already is.
     """
     if not state.phone_ip:
@@ -575,7 +579,7 @@ async def api_hub_describe_port(payload: dict):
     NAME + one RAW Port Mode Information Request per present mode --
     several BLE round trips, not one. Timeout here is generous for the
     same reason /hub/connect's is: this is a slow diagnostic action,
-    not the low-latency dummy /command channel.
+    not the low-latency /command channel.
     """
     if not state.phone_ip:
         return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
@@ -648,6 +652,76 @@ async def api_hub_led(payload: dict):
         data = {"status": "error", "message": str(exc)}
 
     await broadcast({"type": "led_result", "hub": hub, "r": r, "g": g, "b": b, "data": data})
+    return data
+
+
+# Same wiring as android_project/.../WheelMap.kt's PARTS -- duplicated
+# here for the same reason KNOWN_COMMANDS is duplicated across Python/
+# Kotlin: no shared source between the two languages. This side only
+# needs the part *names* for validation -- invert is applied on the
+# phone (WheelMap.kt), not here, so this set intentionally doesn't
+# mirror the invert flags too.
+WHEEL_PARTS = {
+    "front_left_wheel", "front_right_wheel",
+    "rear_left_wheel", "rear_right_wheel",
+    "head_tilt_servo",
+}
+
+
+@app.post("/api/part/set_speed")
+async def api_part_set_speed(payload: dict):
+    """Proxies to the phone's /part/set_speed (see ProbeService.kt's
+    partSetSpeed / WheelMap.kt) -- addresses a wheel/servo by physical
+    part name instead of the caller needing to know which hub+port it's
+    wired to. The phone applies WheelMap's confirmed invert flag, so a
+    given speed here always means the same physical direction across
+    all four wheels."""
+    if not state.phone_ip:
+        return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
+
+    part = (payload or {}).get("part", "")
+    if part not in WHEEL_PARTS:
+        return JSONResponse(
+            {"status": "error", "message": f"part must be one of {sorted(WHEEL_PARTS)}."}, status_code=400
+        )
+    try:
+        speed = float((payload or {}).get("speed", 0.0))
+    except (TypeError, ValueError):
+        return JSONResponse({"status": "error", "message": "speed must be a number, -1.0 to 1.0."}, status_code=400)
+    speed = max(-1.0, min(1.0, speed))
+
+    url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/part/set_speed"
+    try:
+        resp = await asyncio.to_thread(requests.post, url, json={"part": part, "speed": speed}, timeout=8)
+        data = resp.json()
+    except Exception as exc:
+        data = {"status": "error", "message": str(exc)}
+
+    await broadcast({"type": "part_result", "part": part, "action": "set_speed", "speed": speed, "data": data})
+    return data
+
+
+@app.post("/api/part/stop")
+async def api_part_stop(payload: dict):
+    """Proxies to the phone's /part/stop (see ProbeService.kt's
+    partStop / WheelMap.kt)."""
+    if not state.phone_ip:
+        return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
+
+    part = (payload or {}).get("part", "")
+    if part not in WHEEL_PARTS:
+        return JSONResponse(
+            {"status": "error", "message": f"part must be one of {sorted(WHEEL_PARTS)}."}, status_code=400
+        )
+
+    url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/part/stop"
+    try:
+        resp = await asyncio.to_thread(requests.post, url, json={"part": part}, timeout=8)
+        data = resp.json()
+    except Exception as exc:
+        data = {"status": "error", "message": str(exc)}
+
+    await broadcast({"type": "part_result", "part": part, "action": "stop", "data": data})
     return data
 
 

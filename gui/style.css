@@ -171,6 +171,7 @@ button:active { filter: brightness(0.9); }
 .p-ble { grid-column: span 3; }
 .p-hubs { grid-column: span 3; }
 .p-timing { grid-column: span 3; }
+.p-wheels { grid-column: span 12; }
 .p-command { grid-column: span 12; }
 
 @media (max-width: 1100px) {
@@ -539,6 +540,16 @@ footer {
   padding: 1px 4px;
 }
 
+.invert-tag {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--cyan);
+  border: 1px solid var(--cyan);
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+
 .hub-led-color-select {
   background: #0f1114;
   border: 1px solid var(--panel-border);
@@ -659,3 +670,65 @@ footer {
 .mode-name { flex: 1 1 auto; color: var(--ink); }
 .mode-range { color: var(--ink-dim); }
 .mode-io { color: var(--cyan); min-width: 30px; text-align: right; }
+
+/* ---------- wheels ---------- */
+.wheel-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wheel-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  background: #0f1114;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+.wheel-name {
+  flex: 1 1 auto;
+  min-width: 130px;
+}
+
+.wheel-speed {
+  width: 56px;
+  background: #0b0d10;
+  border: 1px solid var(--panel-border);
+  color: var(--ink);
+  border-radius: 5px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 4px 6px;
+}
+
+.wheel-speed:focus {
+  outline: none;
+  border-color: var(--amber-dim);
+}
+
+.wheel-run-btn,
+.wheel-stop-btn {
+  font-size: 11px;
+  padding: 5px 10px;
+}
+
+.wheel-result {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-dim);
+  margin-top: 6px;
+  max-height: 120px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}

@@ -146,17 +146,71 @@ object Lwp {
     fun portModeInformationRequest(portId: Int, mode: Int, infoType: Int): ByteArray =
         encodeMessage(MSG_PORT_MODE_INFO_REQUEST, portId, mode, infoType)
 
+    /** Builds a Port Output Command (0x81) with an arbitrary sub-command --
+     * WriteDirectModeData (0x51) is the special case used for the LED and
+     * for direct port-mode writes; motor commands like StartSpeed use
+     * this same envelope with their own sub-command byte instead. */
+    fun portOutputCommand(portId: Int, subCommand: Int, vararg params: Int): ByteArray =
+        encodeMessage(MSG_PORT_OUTPUT_COMMAND, portId, EXECUTE_IMMEDIATE_WITH_FEEDBACK, subCommand, *params)
+
     fun writeDirectModeData(portId: Int, mode: Int, vararg data: Int): ByteArray =
-        encodeMessage(
-            MSG_PORT_OUTPUT_COMMAND, portId, EXECUTE_IMMEDIATE_WITH_FEEDBACK,
-            SUBCMD_WRITE_DIRECT_MODE_DATA, mode, *data
-        )
+        portOutputCommand(portId, SUBCMD_WRITE_DIRECT_MODE_DATA, mode, *data)
 
     fun setHubLedRgb(r: Int, g: Int, b: Int): ByteArray =
         writeDirectModeData(HUB_LED_PORT, LED_MODE_RGB, r.coerceIn(0, 255), g.coerceIn(0, 255), b.coerceIn(0, 255))
 
     fun setHubLedColor(colorIndex: Int): ByteArray =
         writeDirectModeData(HUB_LED_PORT, LED_MODE_COLOR, colorIndex)
+
+    // -- Motor sub-commands (Output Command 0x81, sub-commands 0x01-0x3F) --
+    // NOT WriteDirectModeData -- confirmed against pylgbst's actual
+    // Motor class (github.com/undera/pylgbst/blob/master/pylgbst/
+    // peripherals.py) that this is a genuinely different sub-command
+    // family, same 0x81 envelope but a different byte here than 0x51.
+    const val SUBCMD_START_SPEED = 0x07
+    const val SUBCMD_START_SPEED_FOR_TIME = 0x09
+
+    // Special values for the "speed"/"power" byte and the "end state"
+    // byte -- per pylgbst's Motor class and the LWP spec's StartPower
+    // section. FLOAT lets the motor spin freely (no resistance); BRAKE
+    // shorts the motor windings (firm stop); HOLD actively drives the
+    // motor to counteract whatever's trying to move it (stiffest stop).
+    const val END_STATE_FLOAT = 0
+    const val END_STATE_HOLD = 126
+    const val END_STATE_BRAKE = 127
+
+    /** Converts a -1.0..1.0 caller-facing speed into the signed -100..100
+     * byte the wire actually wants -- same scaling pylgbst's
+     * abs_scaled_100() does for a normal (non-special) speed value. */
+    fun speedToByte(relative: Double): Int = (relative.coerceIn(-1.0, 1.0) * 100).let { Math.round(it).toInt() }
+
+    /** StartSpeed (sub-command 0x07) -- continuous regulated speed, runs
+     * until the next motor command. useProfile=0b11 (3) applies both the
+     * hub's acceleration and deceleration ramps, matching pylgbst's own
+     * default. speedByte is normally speedToByte()'s output, but pass
+     * END_STATE_BRAKE/END_STATE_HOLD directly for those special cases --
+     * same overload pylgbst's _speed_abs() supports. */
+    fun startSpeed(portId: Int, speedByte: Int, maxPowerPct: Int = 100, useProfile: Int = 0b11): ByteArray =
+        portOutputCommand(portId, SUBCMD_START_SPEED, speedByte, maxPowerPct.coerceIn(0, 100), useProfile)
+
+    /** StartSpeedForTime (sub-command 0x09) with timeMs=0 -- this is
+     * pylgbst's own Motor.stop() (`self.timed(0)`), not StartSpeed with
+     * speed 0. A zero-duration timed move transitions to endState
+     * (BRAKE by default) essentially immediately; replicated exactly
+     * rather than "simplified" to StartSpeed(0), since this exact
+     * command is what's proven to actually stop these motors on this
+     * hardware already (same hubs, driven this way for months under the
+     * old Pi relay). */
+    fun stopMotor(portId: Int, endState: Int = END_STATE_BRAKE, maxPowerPct: Int = 100, useProfile: Int = 0b11): ByteArray =
+        portOutputCommand(
+            portId, SUBCMD_START_SPEED_FOR_TIME,
+            // timeMs as u16 LE, split by hand -- encodeMessage's payload is
+            // a flat Int vararg (each entry becomes one byte), so a
+            // multi-byte field has to be pre-split into its own bytes here.
+            0x00, 0x00,
+            speedToByte(1.0), // speed value is irrelevant at timeMs=0, but must still be a valid byte
+            maxPowerPct.coerceIn(0, 100), endState, useProfile,
+        )
 
     /** Common Header's Message Type byte (offset 2), or null if too short to have one. */
     fun messageType(bytes: ByteArray): Int? = if (bytes.size >= 3) bytes[2].toInt() and 0xFF else null

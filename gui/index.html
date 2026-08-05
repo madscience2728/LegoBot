@@ -188,9 +188,48 @@
       <div class="timing-note">Latency = this PC's clock minus the phone's capture timestamp at send time. Reflects network + processing delay, plus any phone/PC clock offset &mdash; watch the trend, not the absolute number, unless both clocks are NTP-synced.</div>
     </section>
 
+    <!-- WHEELS -->
+    <section class="panel p-wheels">
+      <h2>Wheels &amp; Servo <span class="badge ok">right side inverted</span></h2>
+      <ul class="wheel-list" id="wheelList">
+        <li class="wheel-row" data-part="front_left_wheel">
+          <span class="wheel-name">front-left <span class="addr">rear&nbsp;D</span></span>
+          <input type="number" class="wheel-speed" data-part="front_left_wheel" min="-1" max="1" step="0.1" value="0.3">
+          <button type="button" class="btn-disconnect wheel-run-btn" data-part="front_left_wheel">Run</button>
+          <button type="button" class="btn-disconnect wheel-stop-btn" data-part="front_left_wheel">Stop</button>
+        </li>
+        <li class="wheel-row" data-part="front_right_wheel">
+          <span class="wheel-name">front-right <span class="addr">front&nbsp;C</span> <span class="invert-tag">inverted</span></span>
+          <input type="number" class="wheel-speed" data-part="front_right_wheel" min="-1" max="1" step="0.1" value="0.3">
+          <button type="button" class="btn-disconnect wheel-run-btn" data-part="front_right_wheel">Run</button>
+          <button type="button" class="btn-disconnect wheel-stop-btn" data-part="front_right_wheel">Stop</button>
+        </li>
+        <li class="wheel-row" data-part="rear_left_wheel">
+          <span class="wheel-name">rear-left <span class="addr">rear&nbsp;B</span></span>
+          <input type="number" class="wheel-speed" data-part="rear_left_wheel" min="-1" max="1" step="0.1" value="0.3">
+          <button type="button" class="btn-disconnect wheel-run-btn" data-part="rear_left_wheel">Run</button>
+          <button type="button" class="btn-disconnect wheel-stop-btn" data-part="rear_left_wheel">Stop</button>
+        </li>
+        <li class="wheel-row" data-part="rear_right_wheel">
+          <span class="wheel-name">rear-right <span class="addr">front&nbsp;A</span> <span class="invert-tag">inverted</span></span>
+          <input type="number" class="wheel-speed" data-part="rear_right_wheel" min="-1" max="1" step="0.1" value="0.3">
+          <button type="button" class="btn-disconnect wheel-run-btn" data-part="rear_right_wheel">Run</button>
+          <button type="button" class="btn-disconnect wheel-stop-btn" data-part="rear_right_wheel">Stop</button>
+        </li>
+        <li class="wheel-row" data-part="head_tilt_servo">
+          <span class="wheel-name">head-tilt servo <span class="addr">front&nbsp;B</span></span>
+          <input type="number" class="wheel-speed" data-part="head_tilt_servo" min="-1" max="1" step="0.1" value="0.3">
+          <button type="button" class="btn-disconnect wheel-run-btn" data-part="head_tilt_servo">Run</button>
+          <button type="button" class="btn-disconnect wheel-stop-btn" data-part="head_tilt_servo">Stop</button>
+        </li>
+      </ul>
+      <div class="wheel-result" id="wheelResult"></div>
+      <div class="timing-note">Speed is -1.0..1.0. front-right and rear-right now get their speed negated on the phone (WheelMap.kt) before sending, so positive speed on every wheel should now mean the same physical direction -- confirmed by hand: left side needed no correction, right side did, head-tilt servo needed none either.</div>
+    </section>
+
     <!-- COMMAND CONSOLE -->
     <section class="panel p-command">
-      <h2>Command Console <span class="badge" id="cmdBadge">dummy channel</span></h2>
+      <h2>Command Console <span class="badge" id="cmdBadge">stop/set_speed live</span></h2>
       <div class="cmd-body">
         <form class="cmd-form" id="cmdForm">
           <div class="cmd-row">
@@ -209,7 +248,7 @@
           </div>
         </form>
         <ul class="cmd-log" id="cmdLog">
-          <li class="empty-note" style="border:none;background:none;">No commands sent yet &mdash; this hits the phone's dummy /command endpoint, which logs and echoes back without touching any hardware.</li>
+          <li class="empty-note" style="border:none;background:none;">No commands sent yet &mdash; stop/set_speed dispatch to a real motor on the phone; the rest of this list still just logs and echoes back.</li>
         </ul>
       </div>
     </section>
@@ -376,6 +415,11 @@ function handleMessage(msg) {
       renderLedResult(msg.hub, msg);
       break;
     }
+
+    case 'part_result': {
+      renderPartResult(msg);
+      break;
+    }
   }
 }
 
@@ -436,6 +480,18 @@ function renderLedResult(hub, msg) {
   } else {
     el.innerHTML = `<div class="hub-extra-title">LED (rgb, experimental) set <span class="led-swatch" style="background:rgb(${msg.r},${msg.g},${msg.b})"></span> rgb(${msg.r}, ${msg.g}, ${msg.b})</div>`;
   }
+}
+
+function renderPartResult(msg) {
+  const el = $('wheelResult');
+  if (!el) return;
+  const time = new Date().toLocaleTimeString();
+  const ok = msg.data && msg.data.status === 'ok';
+  const label = msg.action === 'stop' ? 'stop' : `speed ${msg.speed}`;
+  const detail = ok
+    ? `ok`
+    : escapeHtml((msg.data && msg.data.message) ?? 'failed');
+  el.innerHTML = `<div class="${ok ? '' : 'hub-extra-err'}">[${time}] ${escapeHtml(msg.part)} &mdash; ${escapeHtml(label)} &mdash; ${detail}</div>` + el.innerHTML;
 }
 
 const commandHistory = [];
@@ -531,8 +587,10 @@ fetch('/api/status').then(r => r.json()).then(s => {
 // starting point for each command's usual shape, not validated.
 //
 // describe_port is NOT in this list -- it's a real dispatched command
-// now (see the Hubs panel's "Describe port" button), not part of the
-// dummy /command channel this console talks to.
+// (see the Hubs panel's "Describe port" button) reached via its own
+// endpoint, not this /command channel. stop and set_speed ARE in this
+// list and DO really dispatch through /command now (see ProbeService.kt);
+// the rest still just log and echo back.
 const ARGS_HINTS = {
   stop: { port: 'A' },
   set_speed: { port: 'A', speed: 0.4 },
@@ -686,6 +744,49 @@ document.querySelectorAll('.hub-led-btn').forEach(btn => {
     } finally {
       btn.disabled = false;
       btn.textContent = 'Set RGB';
+    }
+  });
+});
+
+document.querySelectorAll('.wheel-run-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const part = btn.dataset.part;
+    const speed = Number(document.querySelector(`.wheel-speed[data-part="${part}"]`).value) || 0;
+    btn.disabled = true;
+    try {
+      const resp = await fetch('/api/part/set_speed', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ part, speed }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) alert(data.message || `request failed (${resp.status})`);
+      // rendering happens via the 'part_result' broadcast on /ws
+    } catch (err) {
+      alert(`request failed: ${err}`);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+});
+
+document.querySelectorAll('.wheel-stop-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const part = btn.dataset.part;
+    btn.disabled = true;
+    try {
+      const resp = await fetch('/api/part/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ part }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) alert(data.message || `request failed (${resp.status})`);
+      // rendering happens via the 'part_result' broadcast on /ws
+    } catch (err) {
+      alert(`request failed: ${err}`);
+    } finally {
+      btn.disabled = false;
     }
   });
 });
