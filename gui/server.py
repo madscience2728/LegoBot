@@ -82,10 +82,13 @@ _NO_CACHE_HEADERS = {"Cache-Control": "no-store, no-cache, must-revalidate"}
 
 # Same vocabulary as old/src/lego_control/hub_controller.py's COMMANDS
 # dict, and ProbeService.kt's KNOWN_COMMANDS on the phone -- duplicated
-# in all three since Python/Kotlin can't share source here. Nothing
-# executes these yet (no hub attached), this just keeps garbage cmd
-# names from silently round-tripping as "ok" the way a bare dict body
-# used to let them.
+# in all three since Python/Kotlin can't share source here.
+#
+# "stop", "set_speed", "preset_zero", "read_apos", and "home_angle" now
+# really dispatch on the phone (see ProbeService.kt's command()); the
+# rest ("read_angle", "set_position", "goto_angle" -- all POS-based, not
+# APOS-based) still just log and echo back until their own encoder-
+# subscription work exists.
 #
 # describe_port is deliberately NOT here anymore -- it graduated to a
 # real dispatched command (see HubConnector.describePort, reached via
@@ -723,6 +726,51 @@ async def api_part_stop(payload: dict):
 
     await broadcast({"type": "part_result", "part": part, "action": "stop", "data": data})
     return data
+
+
+@app.post("/api/face/set")
+async def api_face_set(payload: dict):
+    """Proxies to the phone's /face/set (see ProbeService.kt's faceSet /
+    FaceBus.kt) -- the robot's actual on-screen expression, not just a
+    log line. No server-side validation of "expression" here (unlike
+    WHEEL_PARTS) -- the phone is the single source of truth for its own
+    known vocabulary (FaceBus.EXPRESSIONS), so this just forwards
+    whichever of "expression"/"emoji" the caller gave and lets the phone
+    validate."""
+    if not state.phone_ip:
+        return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
+
+    expression = str((payload or {}).get("expression", "")).strip()
+    emoji = str((payload or {}).get("emoji", "")).strip()
+    if not expression and not emoji:
+        return JSONResponse({"status": "error", "message": "provide 'expression' or 'emoji'."}, status_code=400)
+
+    body = {"expression": expression} if expression else {"emoji": emoji}
+    url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/face/set"
+    try:
+        resp = await asyncio.to_thread(requests.post, url, json=body, timeout=8)
+        data = resp.json()
+    except Exception as exc:
+        data = {"status": "error", "message": str(exc)}
+
+    await broadcast({"type": "face_status", "data": data})
+    return data
+
+
+@app.get("/api/face/status")
+async def api_face_status():
+    """Read-only -- current face plus the known expression vocabulary,
+    for populating the dropdown and showing what's on screen right now
+    without needing to have caught the last /face/set."""
+    if not state.phone_ip:
+        return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
+
+    url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/face/status"
+    try:
+        resp = await asyncio.to_thread(requests.get, url, timeout=8)
+        return resp.json()
+    except Exception as exc:
+        return JSONResponse({"status": "error", "message": str(exc)}, status_code=502)
 
 
 @app.websocket("/ws")

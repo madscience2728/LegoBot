@@ -15,6 +15,7 @@ import android.content.Context
 import android.bluetooth.BluetoothStatusCodes
 import android.os.Build
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
@@ -72,6 +73,16 @@ class HubConnector(private val context: Context, val hubName: String, val label:
     private val pendingLock = Any()
     private var pendingExpectedTypes: Set<Int> = emptySet()
     private var pendingDeferred: CompletableDeferred<ByteArray>? = null
+
+    // Live APOS (mode 3, magnet-based true absolute position) cache, one
+    // entry per subscribed port -- updated continuously from unsolicited
+    // Port Value (Single) (0x45) pushes in onCharacteristicChanged, not
+    // just request/response like sendAndAwait's callers. A port only
+    // appears here once ensureAposSubscription() has subscribed it; see
+    // that function for why a fresh subscribe-and-wait is needed before
+    // the first read.
+    private val aposState = java.util.concurrent.ConcurrentHashMap<Int, Int>()
+    private val aposSubscribedPorts = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
 
     @SuppressLint("MissingPermission") // caller (ProbeService) verifies permissions first
     suspend fun connect(scanTimeoutSeconds: Int = 12): JSONObject {
@@ -161,7 +172,21 @@ class HubConnector(private val context: Context, val hubName: String, val label:
             @Suppress("DEPRECATION") // pre-API33 callback signature -- minSdk 26 needs this overload
             override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
                 val bytes = characteristic.value ?: return
-                CommandBus.post("[$label] <- ${bytes.joinToString(" ") { "%02x".format(it) }}")
+                val type = Lwp.messageType(bytes)
+
+                // Port Value (Single) pushes are continuous, EXPECTED
+                // background traffic once a port is APOS-subscribed (see
+                // ensureAposSubscription) -- a servo sweeping ~90 degrees
+                // in ~1.5s crosses whole-degree boundaries many times a
+                // second, each one a separate 0x45 push at deltaInterval=1.
+                // Hex-dumping every single one to CommandBus (meant for a
+                // human skimming the phone's on-screen log) turned that
+                // log into an unreadable flood the moment gotoApos's live
+                // subscription started running. Still fully processed
+                // below (aposState keeps updating) -- just not logged.
+                if (type != Lwp.MSG_PORT_VALUE_SINGLE) {
+                    CommandBus.post("[$label] <- ${bytes.joinToString(" ") { "%02x".format(it) }}")
+                }
                 // Hand off to whichever sendAndAwait() call is currently
                 // waiting, if this reply's Message Type is one it asked
                 // for. Deliberately NOT unconditional (any reply completes
@@ -169,11 +194,20 @@ class HubConnector(private val context: Context, val hubName: String, val label:
                 // concurrent unsolicited message (Hub Attached I/O,
                 // Generic Error) could otherwise complete the wrong wait
                 // with the wrong bytes.
-                val type = Lwp.messageType(bytes)
                 synchronized(pendingLock) {
                     val deferred = pendingDeferred
                     if (deferred != null && !deferred.isCompleted && type != null && type in pendingExpectedTypes) {
                         deferred.complete(bytes)
+                    }
+                }
+                // Unsolicited (not tied to any single sendAndAwait call) --
+                // a subscribed port pushes these continuously as its value
+                // changes, independent of whichever request happens to be
+                // in flight right now.
+                if (type == Lwp.MSG_PORT_VALUE_SINGLE) {
+                    val portId = Lwp.messagePortId(bytes)
+                    if (portId != null && portId in aposSubscribedPorts) {
+                        Lwp.parseApos(bytes)?.let { aposState[portId] = it }
                     }
                 }
             }
@@ -230,6 +264,8 @@ class HubConnector(private val context: Context, val hubName: String, val label:
         gatt?.close()
         gatt = null
         hubChar = null
+        aposState.clear()
+        aposSubscribedPorts.clear()
         if (wasConnected) CommandBus.post("[$label] disconnected")
         state = HubConnState.DISCONNECTED
     }
@@ -250,6 +286,8 @@ class HubConnector(private val context: Context, val hubName: String, val label:
         gatt?.close()
         gatt = null
         hubChar = null
+        aposState.clear()
+        aposSubscribedPorts.clear()
         state = HubConnState.ERROR
         lastError = message
         CommandBus.post("[$label] x $message")
@@ -457,5 +495,149 @@ class HubConnector(private val context: Context, val hubName: String, val label:
         }
         CommandBus.post("[$label] port $port -> stop (brake)")
         return out.put("status", "ok").put("port", port.uppercase())
+    }
+
+    /** Subscribes a port to live APOS (mode 3) updates if it isn't
+     * already, then waits for at least one value to have actually
+     * arrived -- the 0x47 reply to the subscribe request only confirms
+     * the format was applied, not that the hub has pushed a value yet,
+     * same distinction hub_controller.py's _ensure_angle_subscription
+     * drew for mode 2. Returns null on subscribe failure or timeout;
+     * returns the CACHED value immediately (no wait) if this port was
+     * already subscribed, since aposState keeps updating live in the
+     * background via onCharacteristicChanged. */
+    private suspend fun ensureAposSubscription(portId: Int, waitTimeoutMs: Long = 3000): Int? {
+        if (portId !in aposSubscribedPorts) {
+            val subscribed = sendAndAwait(
+                Lwp.portInputFormatSetupSingle(portId, Lwp.MOTOR_MODE_APOS),
+                setOf(Lwp.MSG_PORT_INPUT_FORMAT_SINGLE), waitTimeoutMs,
+            )
+            if (subscribed == null) return null
+            aposSubscribedPorts.add(portId)
+        }
+        if (aposState[portId] == null) {
+            val deadline = System.currentTimeMillis() + waitTimeoutMs
+            while (aposState[portId] == null && System.currentTimeMillis() < deadline) {
+                delay(20)
+            }
+        }
+        return aposState[portId]
+    }
+
+    /** Reads a motor's TRUE magnet-based absolute position (APOS) --
+     * needs no calibration to be meaningful (unlike mode 2/POS, a
+     * relative counter that resets wherever tracking starts each
+     * session), but DOES need presetZero() called once, with the motor
+     * held at the position that should read 0, before its numbers mean
+     * anything to a caller (e.g. "0 = looking forward" for the head-tilt
+     * servo). */
+    suspend fun readApos(port: String): JSONObject {
+        val out = JSONObject()
+        if (state != HubConnState.CONNECTED) {
+            return out.put("status", "error").put("message", "hub not connected")
+        }
+        val portId = Lwp.PORTS[port.uppercase()]
+            ?: return out.put("status", "error")
+                .put("message", "unknown port '$port', expected one of ${Lwp.PORTS.keys.sorted()}")
+
+        val apos = ensureAposSubscription(portId)
+            ?: return out.put("status", "error").put("message", "no APOS data from encoder on port $port")
+        return out.put("status", "ok").put("port", port.uppercase()).put("apos", apos)
+    }
+
+    /** Recalibrates this motor's TRUE zero reference so its CURRENT
+     * physical position becomes APOS 0 going forward -- a genuine
+     * firmware-level recalibration (see Lwp.presetPosition's doc), not
+     * just resetting a software counter. IMPORTANT: call this only while
+     * the motor is actually at the physical position that should become
+     * 0 (e.g. the head-tilt servo held level, looking straight forward)
+     * -- calling it anywhere else bakes in a wrong reference just as
+     * surely as the one it's meant to fix. */
+    suspend fun presetZero(port: String): JSONObject {
+        val out = JSONObject()
+        if (state != HubConnState.CONNECTED) {
+            return out.put("status", "error").put("message", "hub not connected")
+        }
+        val portId = Lwp.PORTS[port.uppercase()]
+            ?: return out.put("status", "error")
+                .put("message", "unknown port '$port', expected one of ${Lwp.PORTS.keys.sorted()}")
+
+        if (!writeToHub(Lwp.presetPosition(portId, 0))) {
+            return out.put("status", "error").put("message", "BLE write failed")
+        }
+        // Drop any cached/subscribed state and re-subscribe fresh -- we
+        // want the NEXT read to reflect the just-recalibrated zero, not a
+        // value cached from before the preset took effect.
+        aposSubscribedPorts.remove(portId)
+        aposState.remove(portId)
+        delay(150) // brief settle so the firmware applies the recalibration before we re-read
+        val after = ensureAposSubscription(portId)
+
+        CommandBus.post("[$label] port $port -> preset zero (apos after: ${after ?: "unknown"})")
+        val result = out.put("status", "ok").put("port", port.uppercase())
+        if (after != null) result.put("apos_after_preset", after) else result.put("apos_after_preset", JSONObject.NULL)
+        return result
+    }
+
+    /** Moves a motor to an absolute APOS target angle (degrees), using
+     * the current APOS reading to compute the shortest relative delta
+     * (wrapping across the -180/180 boundary) and sending that as a
+     * StartSpeedForDegrees move -- same overall approach as
+     * hub_controller.py's home_angle, adapted from pylgbst's blocking
+     * angled() to this class's fire-and-forget style: rather than
+     * waiting for Port Output Command Feedback (0x82, not parsed yet --
+     * see Lwp's own note on that), this sends the move, waits a fixed
+     * settle window, then reports whatever APOS actually reads
+     * afterward -- the REAL resulting position, not an assumed one,
+     * regardless of whether the settle timing was exactly right.
+     *
+     * targetDegrees should stay roughly within -170..170 -- APOS itself
+     * is hard-bounded to -180..179 (confirmed via describe_port), so
+     * there's no "multiple turns" concept the way a POS-based approach
+     * might assume. */
+    suspend fun gotoApos(
+        port: String, targetDegrees: Double,
+        speed: Double = 0.4, maxPower: Double = 0.5, invert: Boolean = false, settleMs: Long = 1500,
+    ): JSONObject {
+        val out = JSONObject()
+        if (state != HubConnState.CONNECTED) {
+            return out.put("status", "error").put("message", "hub not connected")
+        }
+        val portId = Lwp.PORTS[port.uppercase()]
+            ?: return out.put("status", "error")
+                .put("message", "unknown port '$port', expected one of ${Lwp.PORTS.keys.sorted()}")
+
+        val current = ensureAposSubscription(portId)
+            ?: return out.put("status", "error").put("message", "no APOS data from encoder on port $port")
+
+        var delta = targetDegrees - current
+        if (delta > 180) delta -= 360
+        if (delta < -180) delta += 360
+        val appliedDelta = if (invert) -delta else delta
+
+        // StartSpeedForDegrees wants an UNSIGNED degrees count -- a
+        // negative delta is sent as a positive degrees with the speed's
+        // sign flipped instead, exactly matching pylgbst's angled().
+        var degrees = Math.round(appliedDelta).toInt()
+        var signedSpeed = speed
+        if (degrees < 0) {
+            degrees = -degrees
+            signedSpeed = -signedSpeed
+        }
+        val speedByte = Lwp.speedToByte(signedSpeed)
+        val maxPowerPct = Math.round(maxPower.coerceIn(0.0, 1.0) * 100).toInt()
+
+        if (!writeToHub(Lwp.startSpeedForDegrees(portId, degrees, speedByte, maxPowerPct))) {
+            return out.put("status", "error").put("message", "BLE write failed")
+        }
+        delay(settleMs)
+        val finalApos = aposState[portId] ?: current
+
+        CommandBus.post("[$label] port $port -> goto_apos target=$targetDegrees final=$finalApos")
+        return out.put("status", "ok")
+            .put("port", port.uppercase())
+            .put("target", targetDegrees)
+            .put("final_apos", finalApos)
+            .put("error", targetDegrees - finalApos)
     }
 }

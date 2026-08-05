@@ -25,8 +25,11 @@ object Lwp {
     // -- Message Types (LEGO Hub Characteristic 0x1624) --------------------
     const val MSG_PORT_INFO_REQUEST = 0x21          // Down -- "tell me about this port"
     const val MSG_PORT_MODE_INFO_REQUEST = 0x22      // Down -- "tell me about this port's mode"
+    const val MSG_PORT_INPUT_FORMAT_SETUP_SINGLE = 0x41 // Down -- subscribe to a mode's live updates
     const val MSG_PORT_INFORMATION = 0x43            // Up   -- reply to 0x21
     const val MSG_PORT_MODE_INFORMATION = 0x44       // Up   -- reply to 0x22
+    const val MSG_PORT_VALUE_SINGLE = 0x45           // Up   -- a subscribed mode's live value, unsolicited
+    const val MSG_PORT_INPUT_FORMAT_SINGLE = 0x47    // Up   -- reply to 0x41 (subscription confirmed)
     const val MSG_PORT_OUTPUT_COMMAND = 0x81         // Down -- drive a motor/light/etc
     const val MSG_PORT_OUTPUT_COMMAND_FEEDBACK = 0x82 // Up  -- reply to 0x81 (not consumed yet)
 
@@ -63,6 +66,18 @@ object Lwp {
     // hub_controller.py's PORTS dict, so port letters mean the same thing
     // on both sides of the Pi->phone migration.
     val PORTS: Map<String, Int> = mapOf("A" to 0x00, "B" to 0x01, "C" to 0x02, "D" to 0x03)
+
+    // Technic angular motor mode numbers -- confirmed via a live
+    // describe_port against the actual head-tilt servo (front hub, port
+    // B): "0 POWER -100-100 out / 1 SPEED -100-100 out / 2 POS -360-360
+    // in-out / 3 APOS -180-179 in-out / 4 LOAD 0-127 in-out". Ground
+    // truth from the real device, not the LWP spec's generic numbering
+    // (which can vary per device type) or an assumption.
+    const val MOTOR_MODE_POWER = 0
+    const val MOTOR_MODE_SPEED = 1
+    const val MOTOR_MODE_POS = 2   // relative encoder counter -- resets to 0 wherever tracking starts each session
+    const val MOTOR_MODE_APOS = 3  // magnet-based TRUE absolute position -- survives reconnects/power cycles
+    const val MOTOR_MODE_LOAD = 4
 
     // The hub's own built-in status LED. Per LEGO's Port ID range (0-49 =
     // physical connectors, 50-100 = internal devices), every Control+/
@@ -214,6 +229,82 @@ object Lwp {
 
     /** Common Header's Message Type byte (offset 2), or null if too short to have one. */
     fun messageType(bytes: ByteArray): Int? = if (bytes.size >= 3) bytes[2].toInt() and 0xFF else null
+
+    /** Splits a signed 32-bit value into its 4 little-endian bytes (as
+     * unsigned Ints, ready for encodeMessage's flat payload) -- needed
+     * anywhere a multi-byte field (DeltaInterval, a Degrees/Position
+     * value) has to be hand-packed into the flat one-byte-per-Int
+     * payload encodeMessage()/portOutputCommand() take. */
+    private fun le32(value: Int): IntArray = intArrayOf(
+        value and 0xFF, (value shr 8) and 0xFF, (value shr 16) and 0xFF, (value shr 24) and 0xFF,
+    )
+
+    /** Port Input Format Setup (Single) (0x41) -- subscribes (or
+     * re-subscribes) a port to push live Port Value (Single) (0x45)
+     * updates for one mode. deltaInterval=1 means "push an update on
+     * every change", the same granularity=1 default pylgbst's own
+     * subscribe() uses. Triggers a reply on 0x47 confirming the
+     * subscription took, then ongoing unsolicited 0x45 pushes as the
+     * value changes -- see HubConnector's aposState cache for how those
+     * get consumed. */
+    fun portInputFormatSetupSingle(portId: Int, mode: Int, deltaInterval: Int = 1, notificationEnabled: Boolean = true): ByteArray {
+        val delta = le32(deltaInterval)
+        return encodeMessage(
+            MSG_PORT_INPUT_FORMAT_SETUP_SINGLE, portId, mode,
+            delta[0], delta[1], delta[2], delta[3],
+            if (notificationEnabled) 1 else 0,
+        )
+    }
+
+    /** Recalibrates a motor's zero reference so its CURRENT physical
+     * position becomes `degrees` (0, in the normal case) going forward --
+     * pylgbst's preset_encoder(), for a non-virtual/single motor,
+     * resolves to exactly this: a WriteDirectModeData write straight to
+     * the position mode itself, which the firmware treats as "recalibrate
+     * to this value" rather than a normal live-output write. Confirmed
+     * against pylgbst's actual source (EncodedMotor.preset_encoder() ->
+     * self._write_direct_mode(SENSOR_ANGLE, params) for the single-motor
+     * path), not re-derived from the spec alone. Call this only while the
+     * motor is actually sitting at the physical position that should
+     * become `degrees` -- see HubConnector.presetZero's own doc. */
+    fun presetPosition(portId: Int, degrees: Int): ByteArray {
+        val d = le32(degrees)
+        return writeDirectModeData(portId, MOTOR_MODE_POS, d[0], d[1], d[2], d[3])
+    }
+
+    // StartSpeedForDegrees -- confirmed against pylgbst's EncodedMotor.
+    // angled(): a genuinely relative move, degrees is UNSIGNED (negative
+    // deltas are sent as positive degrees with the speed's sign flipped
+    // instead -- see HubConnector.gotoApos for where that flip happens).
+    const val SUBCMD_START_SPEED_FOR_DEGREES = 0x0B
+
+    /** StartSpeedForDegrees (sub-command 0x0B) -- relative regulated move
+     * of exactly `degrees` (must be >= 0; see SUBCMD_START_SPEED_FOR_DEGREES's
+     * doc for why), then holds at endState. */
+    fun startSpeedForDegrees(
+        portId: Int, degrees: Int, speedByte: Int,
+        maxPowerPct: Int = 100, endState: Int = END_STATE_BRAKE, useProfile: Int = 0b11,
+    ): ByteArray {
+        require(degrees >= 0) { "degrees must be >= 0 -- negative deltas are sent as positive degrees with speed's sign flipped instead" }
+        val d = le32(degrees)
+        return portOutputCommand(
+            portId, SUBCMD_START_SPEED_FOR_DEGREES,
+            d[0], d[1], d[2], d[3], speedByte, maxPowerPct.coerceIn(0, 100), endState, useProfile,
+        )
+    }
+
+    /** Common Header's Port ID byte (offset 3), or null if too short to
+     * have one -- used to route an unsolicited Port Value (Single) (0x45)
+     * push to the right port's cached state. */
+    fun messagePortId(bytes: ByteArray): Int? = if (bytes.size >= 4) bytes[3].toInt() and 0xFF else null
+
+    /** Parses a Port Value (Single) (0x45) push for APOS (mode 3):
+     * (len, hub=0, 0x45, portId, apos: int16 LE) -- 6 bytes total, matching
+     * the confirmed 16-bit signed / -180..179 range from describe_port. */
+    fun parseApos(bytes: ByteArray): Int? {
+        if (bytes.size < 6) return null
+        return ByteBuffer.wrap(bytes, 4, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
+    }
 
     data class PortModeInfo(
         val capabilities: Int,

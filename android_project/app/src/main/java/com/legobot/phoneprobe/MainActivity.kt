@@ -87,7 +87,11 @@ class MainActivity : AppCompatActivity() {
             insets
         }
 
-        log("probe :8765 ready — /health /ble/scan /cam/test /mic/test /command /hub/connect /hub/disconnect /hub/status")
+        log(
+            "probe :8765 ready — /health /ble/scan /cam/test /mic/test /command /hub/connect " +
+                "/hub/disconnect /hub/status /hub/describe_port /hub/led /part/set_speed /part/stop " +
+                "/face/set /face/status"
+        )
         log("media relay :8001 ready — ws /media")
 
         val missing = requiredPermissions.filter {
@@ -103,13 +107,15 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
-        // Only listen while actually visible -- CommandBus is a plain
-        // singleton with no lifecycle awareness of its own.
+        // Only listen while actually visible -- CommandBus/FaceBus are
+        // plain singletons with no lifecycle awareness of their own.
         CommandBus.subscribe { line -> log(line) }
+        FaceBus.subscribe { emoji -> setFace(emoji) }
     }
 
     override fun onStop() {
         CommandBus.unsubscribe()
+        FaceBus.unsubscribe()
         super.onStop()
     }
 
@@ -142,10 +148,9 @@ class MainActivity : AppCompatActivity() {
         ipText.text = ip
     }
 
-    /** Hook for later: once there's a real state machine on the phone,
-     * call this from wherever robot state changes to reflect it here
-     * instead of the static placeholder. */
-    @Suppress("unused")
+    /** Reflects the robot's current expression on screen -- driven by
+     * FaceBus, which ProbeService's /face/set endpoint (and eventually,
+     * the LLM layer's tool calls) pushes new values into. */
     private fun setFace(emoji: String) {
         emojiFace.text = emoji
     }

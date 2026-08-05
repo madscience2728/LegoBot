@@ -51,7 +51,8 @@ class ProbeService : Service() {
         server = ProbeServer(applicationContext).also { it.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false) }
         CommandBus.post(
             "probe :$PORT ready — /health /ble/scan /cam/test /mic/test /command /hub/connect " +
-                "/hub/disconnect /hub/status /hub/describe_port /hub/led /part/set_speed /part/stop"
+                "/hub/disconnect /hub/status /hub/describe_port /hub/led /part/set_speed /part/stop " +
+                "/face/set /face/status"
         )
     }
 
@@ -149,6 +150,8 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
                 "/hub/led" -> hubLed(session)
                 "/part/set_speed" -> partSetSpeed(session)
                 "/part/stop" -> partStop(session)
+                "/face/set" -> faceSet(session)
+                "/face/status" -> faceStatus()
                 else -> JSONObject().put("status", "error").put("message", "No such endpoint: ${session.uri}")
             }
         } catch (e: Exception) {
@@ -173,13 +176,15 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
      * the Pi. Validates cmd/hub against the same vocabulary
      * hub_controller.py's COMMANDS dict defines.
      *
-     * "stop" and "set_speed" now really dispatch to HubConnector (see
-     * below) -- the first two commands in this vocabulary to graduate
-     * out of the dummy log-only path, same way describe_port/led did by
-     * getting their own dedicated endpoints. Everything else here
-     * (read_angle, preset_zero, read_apos, home_angle, set_position,
-     * goto_angle) still needs encoder-subscription infrastructure this
-     * class doesn't have yet, so those stay logged-only for now.
+     * "stop", "set_speed", "preset_zero", "read_apos", and "home_angle"
+     * now really dispatch to HubConnector (see below) -- the head-tilt
+     * servo's fine-control trio (preset_zero/read_apos/home_angle) uses
+     * the motor's magnet-based APOS, not the relative POS counter, so
+     * its numbers survive reconnects and don't need recalibrating every
+     * session -- just once, with the servo held at the position that
+     * should read 0. "read_angle", "set_position", and "goto_angle"
+     * (POS-based) still need their own encoder-subscription work and
+     * stay logged-only.
      */
     private fun command(session: IHTTPSession): JSONObject {
         if (session.method != Method.POST) {
@@ -224,6 +229,17 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
                 connector.setSpeed(
                     args.optString("port", "A"),
                     args.optDouble("speed", 0.0),
+                    args.optBoolean("invert", false),
+                )
+            }
+            "preset_zero" -> runBlocking { connector.presetZero(args.optString("port", "A")) }
+            "read_apos" -> runBlocking { connector.readApos(args.optString("port", "A")) }
+            "home_angle" -> runBlocking {
+                connector.gotoApos(
+                    args.optString("port", "A"),
+                    args.optDouble("target_degrees", 0.0),
+                    args.optDouble("speed", 0.4),
+                    args.optDouble("max_power", 0.5),
                     args.optBoolean("invert", false),
                 )
             }
@@ -413,6 +429,52 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
         val result = runBlocking { connector.stop(wiring.port) }
         return JSONObject().put("status", result.optString("status", "error"))
             .put("part", part).put("hub", wiring.hub).put("port", wiring.port).put("result", result)
+    }
+
+    /** Sets the phone's on-screen emoji face -- the robot's actual
+     * visible expression (see FaceBus, and MainActivity's emojiFace
+     * TextView it drives), not just a log line. Accepts EITHER
+     * "expression" (a known name from FaceBus.EXPRESSIONS -- validated,
+     * the reliable path a future LLM's tool-call should use) OR "emoji"
+     * (an arbitrary raw string -- unvalidated, for anything the fixed
+     * vocabulary doesn't cover yet). "expression" wins if both are
+     * given. */
+    private fun faceSet(session: IHTTPSession): JSONObject {
+        if (session.method != Method.POST) {
+            return JSONObject().put("status", "error").put("message", "/face/set requires POST")
+        }
+        val files = HashMap<String, String>()
+        session.parseBody(files)
+        val body = JSONObject(files["postData"] ?: "{}")
+
+        val expression = body.optString("expression", "").trim()
+        if (expression.isNotEmpty()) {
+            val emoji = FaceBus.setExpression(expression)
+                ?: return JSONObject().put("status", "error")
+                    .put("message", "unknown expression '$expression', expected one of ${FaceBus.EXPRESSIONS.keys.sorted()}")
+            CommandBus.post("face -> ${expression.lowercase()} $emoji")
+            return JSONObject().put("status", "ok").put("expression", expression.lowercase()).put("emoji", emoji)
+        }
+
+        val emoji = body.optString("emoji", "").trim()
+        if (emoji.isEmpty()) {
+            return JSONObject().put("status", "error").put("message", "provide 'expression' or 'emoji'")
+        }
+        FaceBus.setEmoji(emoji)
+        CommandBus.post("face -> $emoji")
+        return JSONObject().put("status", "ok").put("emoji", emoji)
+    }
+
+    /** Read-only -- current face plus the known expression vocabulary,
+     * so a fresh GUI tab (or a future LLM at session start) can see
+     * what's on screen right now and what names it can ask for, without
+     * needing to have been listening for the last /face/set. */
+    private fun faceStatus(): JSONObject {
+        val out = JSONObject()
+        out.put("status", "ok")
+        out.put("emoji", FaceBus.current)
+        out.put("expressions", JSONArray(FaceBus.EXPRESSIONS.keys.sorted()))
+        return out
     }
 
     private fun intParam(session: IHTTPSession, name: String, default: Int): Int {

@@ -61,6 +61,27 @@
       </div>
     </section>
 
+    <!-- FACE -->
+    <section class="panel p-face">
+      <h2>Face <span class="badge" id="faceBadge">--</span></h2>
+      <div class="face-body">
+        <div class="face-display" id="faceDisplay">🙂</div>
+        <div class="face-controls">
+          <div class="hub-controls">
+            <label class="hub-controls-label">Expression</label>
+            <select class="face-expr-select" id="faceExprSelect"></select>
+            <button type="button" class="btn-disconnect" id="faceExprBtn">Set</button>
+          </div>
+          <div class="hub-controls">
+            <label class="hub-controls-label" title="Raw emoji, unvalidated -- for anything the expression list doesn't cover yet.">Custom&nbsp;<span class="experimental-tag">raw</span></label>
+            <input type="text" class="face-emoji-input" id="faceEmojiInput" placeholder="paste an emoji" maxlength="8">
+            <button type="button" class="btn-disconnect" id="faceEmojiBtn">Set</button>
+          </div>
+          <div class="timing-note">Drives the phone's actual on-screen face (MainActivity's emojiFace) via FaceBus -- this is the same control surface a future LLM's tool calls will use.</div>
+        </div>
+      </div>
+    </section>
+
     <!-- HEALTH -->
     <section class="panel p-health">
       <h2>Health <span class="badge" id="healthBadge">--</span></h2>
@@ -229,7 +250,7 @@
 
     <!-- COMMAND CONSOLE -->
     <section class="panel p-command">
-      <h2>Command Console <span class="badge" id="cmdBadge">stop/set_speed live</span></h2>
+      <h2>Command Console <span class="badge" id="cmdBadge">5 of 8 commands live</span></h2>
       <div class="cmd-body">
         <form class="cmd-form" id="cmdForm">
           <div class="cmd-row">
@@ -248,7 +269,7 @@
           </div>
         </form>
         <ul class="cmd-log" id="cmdLog">
-          <li class="empty-note" style="border:none;background:none;">No commands sent yet &mdash; stop/set_speed dispatch to a real motor on the phone; the rest of this list still just logs and echoes back.</li>
+          <li class="empty-note" style="border:none;background:none;">No commands sent yet &mdash; stop/set_speed/preset_zero/read_apos/home_angle dispatch for real on the phone; read_angle/set_position/goto_angle still just log and echo back.</li>
         </ul>
       </div>
     </section>
@@ -272,6 +293,7 @@ const els = {
   vidFpsAge: $('vidFpsAge'), audFpsAge: $('audFpsAge'),
   cmdBadge: $('cmdBadge'), cmdLog: $('cmdLog'),
   hubsBadge: $('hubsBadge'),
+  faceBadge: $('faceBadge'), faceDisplay: $('faceDisplay'), faceExprSelect: $('faceExprSelect'),
 };
 
 // ---- sparkline helper (plain canvas, no deps) ----
@@ -420,6 +442,11 @@ function handleMessage(msg) {
       renderPartResult(msg);
       break;
     }
+
+    case 'face_status': {
+      renderFaceStatus(msg.data);
+      break;
+    }
   }
 }
 
@@ -494,6 +521,25 @@ function renderPartResult(msg) {
   el.innerHTML = `<div class="${ok ? '' : 'hub-extra-err'}">[${time}] ${escapeHtml(msg.part)} &mdash; ${escapeHtml(label)} &mdash; ${detail}</div>` + el.innerHTML;
 }
 
+let faceExpressionsPopulated = false;
+
+function populateFaceExpressions(names) {
+  if (faceExpressionsPopulated || !els.faceExprSelect || !names.length) return;
+  els.faceExprSelect.innerHTML = names
+    .map(n => `<option value="${escapeHtml(n)}"${n === 'neutral' ? ' selected' : ''}>${escapeHtml(n)}</option>`)
+    .join('');
+  faceExpressionsPopulated = true;
+}
+
+function renderFaceStatus(data) {
+  if (data.status !== 'ok') {
+    setBadge(els.faceBadge, 'error', 'bad');
+    return;
+  }
+  if (els.faceDisplay) els.faceDisplay.textContent = data.emoji ?? '🙂';
+  setBadge(els.faceBadge, 'live', 'ok');
+}
+
 const commandHistory = [];
 
 function renderCommandLog() {
@@ -547,6 +593,22 @@ async function refreshHubStatus() {
   } catch (e) { /* phone not reachable yet -- leave badges as-is */ }
 }
 
+async function refreshFaceStatus() {
+  // Same reasoning as refreshHubStatus -- FaceBus's current value lives
+  // on the phone, not here, so a fresh tab needs to actually ask rather
+  // than assume the default neutral face.
+  try {
+    const resp = await fetch('/api/face/status');
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.status === 'ok') {
+        populateFaceExpressions(data.expressions ?? []);
+        renderFaceStatus(data);
+      }
+    }
+  } catch (e) { /* phone not reachable yet -- leave face as-is */ }
+}
+
 fetch('/api/status').then(r => r.json()).then(s => {
   if (s.phone_ip) {
     els.connSub.textContent = `phone ${s.phone_ip}`;
@@ -572,6 +634,7 @@ fetch('/api/status').then(r => r.json()).then(s => {
     // Already connected (GUI server had a live session) -- get a fresh
     // read on hub state rather than relying on the cache above.
     refreshHubStatus();
+    refreshFaceStatus();
   } else if (storedIp) {
     // Not connected yet, but we remember an IP from last time --
     // reconnect automatically instead of making the person retype it.
@@ -630,6 +693,7 @@ $('connectForm').addEventListener('submit', async (e) => {
     body: JSON.stringify({ ip }),
   });
   refreshHubStatus();
+  refreshFaceStatus();
 });
 
 $('disconnectBtn').addEventListener('click', async () => {
@@ -789,6 +853,48 @@ document.querySelectorAll('.wheel-stop-btn').forEach(btn => {
       btn.disabled = false;
     }
   });
+});
+
+$('faceExprBtn').addEventListener('click', async () => {
+  const expression = els.faceExprSelect.value;
+  if (!expression) return;
+  const btn = $('faceExprBtn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/face/set', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expression }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) alert(data.message || `request failed (${resp.status})`);
+    // rendering happens via the 'face_status' broadcast on /ws
+  } catch (err) {
+    alert(`request failed: ${err}`);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('faceEmojiBtn').addEventListener('click', async () => {
+  const emoji = $('faceEmojiInput').value.trim();
+  if (!emoji) return;
+  const btn = $('faceEmojiBtn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/face/set', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ emoji }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) alert(data.message || `request failed (${resp.status})`);
+    // rendering happens via the 'face_status' broadcast on /ws
+  } catch (err) {
+    alert(`request failed: ${err}`);
+  } finally {
+    btn.disabled = false;
+  }
 });
 
 $('cmdForm').addEventListener('submit', async (e) => {
