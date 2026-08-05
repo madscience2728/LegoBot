@@ -52,7 +52,7 @@ class CameraStream(private val context: Context) {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val cameraId = manager.cameraIdList.firstOrNull { id ->
             manager.getCameraCharacteristics(id)
-                .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+                .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
         } ?: manager.cameraIdList.firstOrNull() ?: return
 
         val size = android.util.Size(640, 480)
