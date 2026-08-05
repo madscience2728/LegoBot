@@ -248,6 +248,40 @@
       <div class="timing-note">Speed is -1.0..1.0. front-right and rear-right now get their speed negated on the phone (WheelMap.kt) before sending, so positive speed on every wheel should now mean the same physical direction -- confirmed by hand: left side needed no correction, right side did, head-tilt servo needed none either.</div>
     </section>
 
+    <!-- DRIVE -->
+    <section class="panel p-drive">
+      <h2>Drive <span class="badge">exact LLM command format</span></h2>
+      <div class="drive-body">
+        <div class="drive-params">
+          <label class="hub-controls-label">speed <span id="driveSpeedVal">0.5</span></label>
+          <input type="range" id="driveSpeed" min="0" max="1" step="0.05" value="0.5">
+          <label class="hub-controls-label">duration_s <span id="driveDurationVal">1.0</span></label>
+          <input type="range" id="driveDuration" min="0" max="5" step="0.25" value="1">
+        </div>
+        <div class="drive-buttons">
+          <div class="drive-group">
+            <div class="drive-group-label">wheels &mdash; speed + duration_s</div>
+            <div class="drive-row">
+              <button type="button" class="btn-connect drive-btn" data-command="go_forward">Forward</button>
+              <button type="button" class="btn-connect drive-btn" data-command="go_back">Back</button>
+              <button type="button" class="btn-connect drive-btn" data-command="turn_left">Turn Left</button>
+              <button type="button" class="btn-connect drive-btn" data-command="turn_right">Turn Right</button>
+            </div>
+          </div>
+          <div class="drive-group">
+            <div class="drive-group-label">head tilt &mdash; fixed presets, no speed/duration</div>
+            <div class="drive-row">
+              <button type="button" class="btn-connect drive-btn" data-command="tilt_head_up">Look Up (-45)</button>
+              <button type="button" class="btn-connect drive-btn" data-command="tilt_head_center">Forward (0)</button>
+              <button type="button" class="btn-connect drive-btn" data-command="tilt_head_down">Look Down (+45)</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="wheel-result" id="driveResult"></div>
+      <div class="timing-note">Sends exactly {command, speed, duration_s} (wheels) or {command} (tilt) to /drive -- the same shape a future LLM tool call will send. This IS the validation step: watch the robot, not the JSON.</div>
+    </section>
+
     <!-- COMMAND CONSOLE -->
     <section class="panel p-command">
       <h2>Command Console <span class="badge" id="cmdBadge">5 of 8 commands live</span></h2>
@@ -447,6 +481,11 @@ function handleMessage(msg) {
       renderFaceStatus(msg.data);
       break;
     }
+
+    case 'drive_result': {
+      renderDriveResult(msg);
+      break;
+    }
   }
 }
 
@@ -538,6 +577,16 @@ function renderFaceStatus(data) {
   }
   if (els.faceDisplay) els.faceDisplay.textContent = data.emoji ?? '🙂';
   setBadge(els.faceBadge, 'live', 'ok');
+}
+
+function renderDriveResult(msg) {
+  const el = $('driveResult');
+  if (!el) return;
+  const time = new Date((msg.sent_at ?? Date.now() / 1000) * 1000).toLocaleTimeString();
+  const ok = msg.data && msg.data.status === 'ok';
+  const params = msg.body && msg.body.speed != null ? ` speed=${msg.body.speed} duration_s=${msg.body.duration_s}` : '';
+  const detail = ok ? 'ok' : escapeHtml((msg.data && msg.data.message) ?? 'failed');
+  el.innerHTML = `<div class="${ok ? '' : 'hub-extra-err'}">[${time}] ${escapeHtml(msg.command)}${escapeHtml(params)} &mdash; ${detail}</div>` + el.innerHTML;
 }
 
 const commandHistory = [];
@@ -895,6 +944,46 @@ $('faceEmojiBtn').addEventListener('click', async () => {
   } finally {
     btn.disabled = false;
   }
+});
+
+// ---- drive panel ----
+const driveSpeedInput = $('driveSpeed');
+const driveDurationInput = $('driveDuration');
+if (driveSpeedInput) {
+  driveSpeedInput.addEventListener('input', () => {
+    $('driveSpeedVal').textContent = Number(driveSpeedInput.value).toFixed(2);
+  });
+}
+if (driveDurationInput) {
+  driveDurationInput.addEventListener('input', () => {
+    $('driveDurationVal').textContent = Number(driveDurationInput.value).toFixed(2);
+  });
+}
+
+document.querySelectorAll('.drive-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const command = btn.dataset.command;
+    const body = { command };
+    if (command === 'go_forward' || command === 'go_back' || command === 'turn_left' || command === 'turn_right') {
+      body.speed = Number(driveSpeedInput.value);
+      body.duration_s = Number(driveDurationInput.value);
+    }
+    btn.disabled = true;
+    try {
+      const resp = await fetch('/api/drive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await resp.json();
+      if (!resp.ok) alert(data.message || `request failed (${resp.status})`);
+      // rendering happens via the 'drive_result' broadcast on /ws
+    } catch (err) {
+      alert(`request failed: ${err}`);
+    } finally {
+      btn.disabled = false;
+    }
+  });
 });
 
 $('cmdForm').addEventListener('submit', async (e) => {

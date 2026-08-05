@@ -208,6 +208,23 @@ object Lwp {
     fun startSpeed(portId: Int, speedByte: Int, maxPowerPct: Int = 100, useProfile: Int = 0b11): ByteArray =
         portOutputCommand(portId, SUBCMD_START_SPEED, speedByte, maxPowerPct.coerceIn(0, 100), useProfile)
 
+    /** StartSpeedForTime (sub-command 0x09) -- runs at speedByte for
+     * timeMs milliseconds (hub-side timer, not app-side sleep+stop),
+     * then transitions to endState. stopMotor() below is just this at
+     * timeMs=0 -- see its own doc for why that specific command (not
+     * StartSpeed(0)) is what's proven to actually stop these motors. */
+    fun startSpeedForTime(
+        portId: Int, timeMs: Int, speedByte: Int,
+        maxPowerPct: Int = 100, endState: Int = END_STATE_BRAKE, useProfile: Int = 0b11,
+    ): ByteArray {
+        val t = timeMs.coerceIn(0, 65535) // u16 -- 65.535s ceiling, well past our 5s LLM-facing cap
+        return portOutputCommand(
+            portId, SUBCMD_START_SPEED_FOR_TIME,
+            t and 0xFF, (t shr 8) and 0xFF, // timeMs as u16 LE
+            speedByte, maxPowerPct.coerceIn(0, 100), endState, useProfile,
+        )
+    }
+
     /** StartSpeedForTime (sub-command 0x09) with timeMs=0 -- this is
      * pylgbst's own Motor.stop() (`self.timed(0)`), not StartSpeed with
      * speed 0. A zero-duration timed move transitions to endState
@@ -217,15 +234,7 @@ object Lwp {
      * hardware already (same hubs, driven this way for months under the
      * old Pi relay). */
     fun stopMotor(portId: Int, endState: Int = END_STATE_BRAKE, maxPowerPct: Int = 100, useProfile: Int = 0b11): ByteArray =
-        portOutputCommand(
-            portId, SUBCMD_START_SPEED_FOR_TIME,
-            // timeMs as u16 LE, split by hand -- encodeMessage's payload is
-            // a flat Int vararg (each entry becomes one byte), so a
-            // multi-byte field has to be pre-split into its own bytes here.
-            0x00, 0x00,
-            speedToByte(1.0), // speed value is irrelevant at timeMs=0, but must still be a valid byte
-            maxPowerPct.coerceIn(0, 100), endState, useProfile,
-        )
+        startSpeedForTime(portId, 0, speedToByte(1.0), maxPowerPct, endState, useProfile)
 
     /** Common Header's Message Type byte (offset 2), or null if too short to have one. */
     fun messageType(bytes: ByteArray): Int? = if (bytes.size >= 3) bytes[2].toInt() and 0xFF else null

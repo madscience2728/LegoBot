@@ -90,7 +90,7 @@ class MainActivity : AppCompatActivity() {
         log(
             "probe :8765 ready — /health /ble/scan /cam/test /mic/test /command /hub/connect " +
                 "/hub/disconnect /hub/status /hub/describe_port /hub/led /part/set_speed /part/stop " +
-                "/face/set /face/status"
+                "/face/set /face/status /drive"
         )
         log("media relay :8001 ready — ws /media")
 

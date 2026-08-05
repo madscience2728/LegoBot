@@ -476,6 +476,39 @@ class HubConnector(private val context: Context, val hubName: String, val label:
         return out.put("status", "ok").put("port", port.uppercase()).put("speed", speed).put("invert", invert)
     }
 
+    /** Timed regulated drive on one motor port -- runs at `speed` for
+     * `durationS` seconds then auto-brakes, entirely handled by the
+     * hub's own firmware timer (StartSpeedForTime, sub-command 0x09)
+     * rather than this app sleeping and sending a follow-up stop. That
+     * matters for multi-wheel commands (DriveController's go_forward
+     * etc): each wheel's hub times its own motor independently, so all
+     * four stay in sync even though the handful of BLE writes that kick
+     * them off aren't perfectly simultaneous -- app-side sleep+stop
+     * would add that skew back in, once per wheel, on top of BLE write
+     * latency each way. Same invert convention as setSpeed. */
+    suspend fun driveForTime(
+        port: String, speed: Double, durationS: Double, invert: Boolean = false, maxPower: Double = 1.0,
+    ): JSONObject {
+        val out = JSONObject()
+        if (state != HubConnState.CONNECTED) {
+            return out.put("status", "error").put("message", "hub not connected")
+        }
+        val portId = Lwp.PORTS[port.uppercase()]
+            ?: return out.put("status", "error")
+                .put("message", "unknown port '$port', expected one of ${Lwp.PORTS.keys.sorted()}")
+
+        val actualSpeed = if (invert) -speed else speed
+        val speedByte = Lwp.speedToByte(actualSpeed)
+        val timeMs = Math.round(durationS.coerceIn(0.0, 65.0) * 1000).toInt()
+        val maxPowerPct = Math.round(maxPower.coerceIn(0.0, 1.0) * 100).toInt()
+        if (!writeToHub(Lwp.startSpeedForTime(portId, timeMs, speedByte, maxPowerPct))) {
+            return out.put("status", "error").put("message", "BLE write failed")
+        }
+        CommandBus.post("[$label] port $port -> speed $speed for ${durationS}s${if (invert) " (inverted)" else ""}")
+        return out.put("status", "ok").put("port", port.uppercase())
+            .put("speed", speed).put("duration_s", durationS).put("invert", invert)
+    }
+
     /** Stops one motor port -- StartSpeedForTime(0ms, endState=BRAKE),
      * exactly matching pylgbst's Motor.stop() (`self.timed(0)`), not
      * StartSpeed(0). See Lwp.stopMotor's doc for why that distinction

@@ -173,6 +173,7 @@ button:active { filter: brightness(0.9); }
 .p-timing { grid-column: span 3; }
 .p-wheels { grid-column: span 12; }
 .p-face { grid-column: span 12; }
+.p-drive { grid-column: span 12; }
 .p-command { grid-column: span 12; }
 
 @media (max-width: 1100px) {
@@ -793,4 +794,50 @@ footer {
 .face-emoji-input:focus {
   outline: none;
   border-color: var(--amber-dim);
+}
+
+/* ---------- drive ---------- */
+.drive-body {
+  display: flex;
+  gap: 24px;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.drive-params {
+  flex: 0 0 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.drive-params input[type="range"] {
+  width: 100%;
+  accent-color: var(--amber);
+  margin-bottom: 6px;
+}
+
+.drive-buttons {
+  flex: 1 1 400px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.drive-group-label {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-dim);
+  margin-bottom: 6px;
+}
+
+.drive-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.drive-btn {
+  font-size: 12px;
+  padding: 8px 14px;
 }

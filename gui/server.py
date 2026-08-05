@@ -773,6 +773,56 @@ async def api_face_status():
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=502)
 
 
+DRIVE_COMMANDS = {
+    "go_forward", "go_back", "turn_left", "turn_right",
+    "tilt_head_up", "tilt_head_down", "tilt_head_center",
+}
+
+
+@app.post("/api/drive")
+async def api_drive(payload: dict):
+    """Proxies to the phone's /drive (see ProbeService.kt's drive() /
+    DriveController.kt) -- the actual command surface the future LLM
+    layer will call, exposed here so the Drive panel can exercise the
+    EXACT SAME format a tool call will send: {command, speed,
+    duration_s} for the wheel commands, {command} alone for
+    tilt_head_*. This IS the validation step -- watching the robot
+    respond to this exact shape from a browser button, before any LLM
+    is in the loop at all."""
+    if not state.phone_ip:
+        return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
+
+    command = str((payload or {}).get("command", "")).strip().lower()
+    if command not in DRIVE_COMMANDS:
+        return JSONResponse(
+            {"status": "error", "message": f"command must be one of {sorted(DRIVE_COMMANDS)}."}, status_code=400
+        )
+
+    body = {"command": command}
+    if command in ("go_forward", "go_back", "turn_left", "turn_right"):
+        try:
+            speed = float((payload or {}).get("speed", 0.5))
+            duration_s = float((payload or {}).get("duration_s", 1.0))
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"status": "error", "message": "speed/duration_s must be numbers."}, status_code=400
+            )
+        body["speed"] = max(0.0, min(1.0, speed))
+        body["duration_s"] = max(0.0, min(5.0, duration_s))
+
+    url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/drive"
+    sent_at = time.time()
+    try:
+        resp = await asyncio.to_thread(requests.post, url, json=body, timeout=15)
+        data = resp.json()
+    except Exception as exc:
+        data = {"status": "error", "message": str(exc)}
+
+    result = {"type": "drive_result", "command": command, "body": body, "sent_at": sent_at, "data": data}
+    await broadcast(result)
+    return result
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()

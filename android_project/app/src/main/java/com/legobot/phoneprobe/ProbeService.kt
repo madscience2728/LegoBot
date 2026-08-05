@@ -52,7 +52,7 @@ class ProbeService : Service() {
         CommandBus.post(
             "probe :$PORT ready — /health /ble/scan /cam/test /mic/test /command /hub/connect " +
                 "/hub/disconnect /hub/status /hub/describe_port /hub/led /part/set_speed /part/stop " +
-                "/face/set /face/status"
+                "/face/set /face/status /drive"
         )
     }
 
@@ -134,6 +134,11 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
         "rear" to HubConnector(context, hubName = "Daril", label = "rear"),
     )
 
+    // The actual command surface a future LLM's tool calls will use --
+    // see DriveController's own doc for the turn/tilt kinematics this
+    // rides on.
+    private val driveController = DriveController(hubs)
+
     override fun serve(session: IHTTPSession): Response {
         val result: JSONObject = try {
             when (session.uri.trimEnd('/')) {
@@ -152,6 +157,7 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
                 "/part/stop" -> partStop(session)
                 "/face/set" -> faceSet(session)
                 "/face/status" -> faceStatus()
+                "/drive" -> drive(session)
                 else -> JSONObject().put("status", "error").put("message", "No such endpoint: ${session.uri}")
             }
         } catch (e: Exception) {
@@ -475,6 +481,50 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
         out.put("emoji", FaceBus.current)
         out.put("expressions", JSONArray(FaceBus.EXPRESSIONS.keys.sorted()))
         return out
+    }
+
+    /** The actual command surface a future LLM's tool calls will use --
+     * see DriveController for the turn/tilt kinematics this rides on
+     * (pivot-in-place turns, fixed-preset head tilt), both hand-
+     * confirmed rather than assumed. Distinct from /part/set_speed's
+     * raw per-wheel control: that endpoint says WHICH MOTOR to move,
+     * this says WHAT THE ROBOT SHOULD DO.
+     *
+     * speed is 0.0-1.0 (magnitude only -- direction comes from the
+     * command name, e.g. go_forward vs go_back, not from speed's sign);
+     * duration_s is 0.0-5.0. Both are clamped, not rejected, on an
+     * out-of-range value -- consistent with how every other numeric arg
+     * in this codebase (LED r/g/b, wheel speed) has been handled: a
+     * slightly-out-of-range tool call still does something reasonable
+     * instead of erroring the whole command out. tilt_head_* ignores
+     * both -- see DriveController's doc for why. */
+    private fun drive(session: IHTTPSession): JSONObject {
+        if (session.method != Method.POST) {
+            return JSONObject().put("status", "error").put("message", "/drive requires POST")
+        }
+        val files = HashMap<String, String>()
+        session.parseBody(files)
+        val body = JSONObject(files["postData"] ?: "{}")
+        val command = body.optString("command", "").trim().lowercase()
+        val speed = body.optDouble("speed", 0.5).let { if (it.isNaN()) 0.5 else it }
+        val durationS = body.optDouble("duration_s", 1.0).let { if (it.isNaN()) 1.0 else it }
+
+        return runBlocking {
+            when (command) {
+                "go_forward" -> driveController.goForward(speed, durationS)
+                "go_back" -> driveController.goBack(speed, durationS)
+                "turn_left" -> driveController.turnLeft(speed, durationS)
+                "turn_right" -> driveController.turnRight(speed, durationS)
+                "tilt_head_up" -> driveController.tiltHead("up")
+                "tilt_head_down" -> driveController.tiltHead("down")
+                "tilt_head_center" -> driveController.tiltHead("center")
+                else -> JSONObject().put("status", "error").put(
+                    "message",
+                    "unknown command '$command', expected one of go_forward, go_back, turn_left, " +
+                        "turn_right, tilt_head_up, tilt_head_down, tilt_head_center",
+                )
+            }
+        }
     }
 
     private fun intParam(session: IHTTPSession, name: String, default: Int): Int {
