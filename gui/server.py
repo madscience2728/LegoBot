@@ -86,8 +86,15 @@ _NO_CACHE_HEADERS = {"Cache-Control": "no-store, no-cache, must-revalidate"}
 # executes these yet (no hub attached), this just keeps garbage cmd
 # names from silently round-tripping as "ok" the way a bare dict body
 # used to let them.
+#
+# describe_port is deliberately NOT here anymore -- it graduated to a
+# real dispatched command (see HubConnector.describePort, reached via
+# its own /api/hub/describe_port route below), same as hub connect/
+# disconnect never lived in this dummy list either. Leaving it here
+# would let it round-trip through the dummy /command channel with a
+# fake "logged only" response instead of the real one.
 KNOWN_COMMANDS = {
-    "stop", "set_speed", "read_angle", "preset_zero", "describe_port",
+    "stop", "set_speed", "read_angle", "preset_zero",
     "read_apos", "home_angle", "set_position", "goto_angle",
 }
 
@@ -559,6 +566,89 @@ async def api_hub_status():
         return data
     except Exception as exc:
         return JSONResponse({"status": "error", "message": str(exc)}, status_code=502)
+
+
+@app.post("/api/hub/describe_port")
+async def api_hub_describe_port(payload: dict):
+    """Proxies to the phone's /hub/describe_port (see HubConnector.
+    describePort), which does a Port Information Request plus one
+    NAME + one RAW Port Mode Information Request per present mode --
+    several BLE round trips, not one. Timeout here is generous for the
+    same reason /hub/connect's is: this is a slow diagnostic action,
+    not the low-latency dummy /command channel.
+    """
+    if not state.phone_ip:
+        return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
+
+    hub = (payload or {}).get("hub", "").strip().lower()
+    if hub not in ("front", "rear"):
+        return JSONResponse({"status": "error", "message": "hub must be 'front' or 'rear'."}, status_code=400)
+    port = (payload or {}).get("port", "").strip().upper()
+    if port not in ("A", "B", "C", "D"):
+        return JSONResponse({"status": "error", "message": "port must be one of A, B, C, D."}, status_code=400)
+
+    url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/hub/describe_port"
+    try:
+        # Worst case on the phone: total_mode_count present modes, each
+        # needing a NAME request + a RAW request at up to 2s timeout
+        # apiece (see HubConnector.describePort) -- 45s covers a
+        # generously multi-mode device with room to spare.
+        resp = await asyncio.to_thread(requests.post, url, json={"hub": hub, "port": port}, timeout=45)
+        data = resp.json()
+    except Exception as exc:
+        data = {"status": "error", "message": str(exc)}
+
+    await broadcast({"type": "port_info", "hub": hub, "port": port, "data": data})
+    return data
+
+
+@app.post("/api/hub/led")
+async def api_hub_led(payload: dict):
+    """Proxies to the phone's /hub/led (see HubConnector.setLedColor /
+    setLedRgb) -- a single fire-and-forget BLE write, so this is a fast
+    one-shot action like /api/command, not a slow one like /hub/connect.
+
+    Accepts EITHER "color" (LEGO's Mode-0 palette, e.g. "GREEN" -- the
+    reliable path, confirmed to actually change the phone's connected
+    hub's physical LED) OR "r"/"g"/"b" (Mode-1 direct RGB -- spec-legal,
+    NOT confirmed to render; see HubConnector.setLedRgb's doc comment).
+    "color" wins if both are given.
+    """
+    if not state.phone_ip:
+        return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
+
+    hub = (payload or {}).get("hub", "").strip().lower()
+    if hub not in ("front", "rear"):
+        return JSONResponse({"status": "error", "message": "hub must be 'front' or 'rear'."}, status_code=400)
+
+    color = str((payload or {}).get("color", "")).strip().upper()
+    if color:
+        url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/hub/led"
+        try:
+            resp = await asyncio.to_thread(requests.post, url, json={"hub": hub, "color": color}, timeout=8)
+            data = resp.json()
+        except Exception as exc:
+            data = {"status": "error", "message": str(exc)}
+        await broadcast({"type": "led_result", "hub": hub, "color": color, "data": data})
+        return data
+
+    try:
+        r = int((payload or {}).get("r", 0))
+        g = int((payload or {}).get("g", 0))
+        b = int((payload or {}).get("b", 0))
+    except (TypeError, ValueError):
+        return JSONResponse({"status": "error", "message": "r/g/b must be integers 0-255."}, status_code=400)
+    r, g, b = (max(0, min(255, v)) for v in (r, g, b))
+
+    url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/hub/led"
+    try:
+        resp = await asyncio.to_thread(requests.post, url, json={"hub": hub, "r": r, "g": g, "b": b}, timeout=8)
+        data = resp.json()
+    except Exception as exc:
+        data = {"status": "error", "message": str(exc)}
+
+    await broadcast({"type": "led_result", "hub": hub, "r": r, "g": g, "b": b, "data": data})
+    return data
 
 
 @app.websocket("/ws")

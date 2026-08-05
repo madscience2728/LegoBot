@@ -260,16 +260,15 @@ class HubConnector(private val context: Context, val hubName: String, val label:
     //
     // Everything below is the "stage after this one" the class doc
     // mentions: real Port Output/Information Request messages, not just
-    // proving the notify subscription works. Two commands for now,
-    // matching hub_controller.py's oldest/simplest pair:
+    // proving the notify subscription works.
     //   - describePort: read-only diagnostic (Port Information + Port
     //     Mode Information requests), safe to call any time.
-    //   - setLedRgb: the first real *output* command, deliberately picked
-    //     as the first one to ship because success is visible on the hub
-    //     itself (the LED changes color) rather than only in a log line --
-    //     the same "don't take delivery on faith" reasoning as
-    //     HubConnState.SUBSCRIBING existing as a distinct step from
-    //     CONNECTING above.
+    //   - setLedColor: the first real *output* command, and the reliable
+    //     one -- LEGO's fixed Mode-0 color palette, the same path
+    //     pylgbst/node-poweredup actually use and the one confirmed to
+    //     visibly change our own hub's LED.
+    //   - setLedRgb: Mode-1 direct RGB, spec-legal but NOT confirmed to
+    //     render on our hub -- see its own doc comment.
 
     @SuppressLint("MissingPermission") // caller (ProbeService) verifies permissions first
     private fun writeToHub(bytes: ByteArray): Boolean {
@@ -363,13 +362,41 @@ class HubConnector(private val context: Context, val hubName: String, val label:
             .put("modes", modesOut)
     }
 
-    /** Sets the hub's own status LED to an exact R/G/B color -- the first
-     * real Port Output Command this class sends. Success here means the
-     * BLE write completed; it does NOT yet wait for the Port Output
-     * Command Feedback (0x82) reply the EXECUTE_IMMEDIATE_WITH_FEEDBACK
-     * flag requests -- that's the natural next step once feedback parsing
-     * is worth adding, but seeing the hub's actual LED change color is
-     * proof enough for this first pass. */
+    /** Sets the hub's own status LED to one of LEGO's fixed Mode-0
+     * colors (see Lwp.LedColor) -- the RELIABLE path. Unlike setLedRgb
+     * below, this is the exact command pylgbst's README example and
+     * node-poweredup both use, and the one confirmed to actually change
+     * the physical LED on our own hub. Prefer this over setLedRgb unless
+     * you specifically need a color outside LEGO's 11-entry palette and
+     * are prepared for it possibly not rendering (see setLedRgb's doc). */
+    suspend fun setLedColor(colorIndex: Int): JSONObject {
+        val out = JSONObject()
+        if (state != HubConnState.CONNECTED) {
+            return out.put("status", "error").put("message", "hub not connected")
+        }
+        if (colorIndex !in 0..10 && colorIndex != 255) {
+            return out.put("status", "error").put("message", "color index must be 0-10 or 255 (NONE)")
+        }
+        if (!writeToHub(Lwp.setHubLedColor(colorIndex))) {
+            return out.put("status", "error").put("message", "BLE write failed")
+        }
+        CommandBus.post("[$label] LED -> color index $colorIndex")
+        return out.put("status", "ok").put("port", "LED").put("color_index", colorIndex)
+    }
+
+    /** Sets the hub's own status LED to an exact R/G/B color via Mode 1
+     * (direct RGB) -- the first real Port Output Command this class
+     * sent, and still spec-legal, but NOT reliable: confirmed against
+     * our own hub that this write is accepted (BLE write succeeds, same
+     * write path describe_port's 0x21/0x22 requests use successfully)
+     * without the physical LED visibly changing. The spec's own
+     * WriteDirectModeData section hints why -- a mode-1 write can be
+     * stored without being shown unless the port's currently active mode
+     * is actually mode 1, which a bare WriteDirectModeData does not
+     * change. Prefer setLedColor() above for anything that needs to
+     * actually be seen; this is kept for a custom color outside LEGO's
+     * 11-entry palette, and as the basis for trying a proper mode switch
+     * (Port Input Format Setup, 0x41) first if that's ever worth adding. */
     suspend fun setLedRgb(r: Int, g: Int, b: Int): JSONObject {
         val out = JSONObject()
         if (state != HubConnState.CONNECTED) {
@@ -378,7 +405,7 @@ class HubConnector(private val context: Context, val hubName: String, val label:
         if (!writeToHub(Lwp.setHubLedRgb(r, g, b))) {
             return out.put("status", "error").put("message", "BLE write failed")
         }
-        CommandBus.post("[$label] LED -> rgb($r, $g, $b)")
+        CommandBus.post("[$label] LED -> rgb($r, $g, $b) [mode 1 -- unconfirmed, may not render]")
         return out.put("status", "ok").put("port", "LED").put("r", r).put("g", g).put("b", b)
     }
 }

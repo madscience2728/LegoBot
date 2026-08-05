@@ -76,11 +76,55 @@ object Lwp {
 
     // RGB Light's Mode 1 ("RGB O") -- direct R/G/B bytes, 0-255 each, per
     // LEGO's own WriteDirectModeData example in the spec text itself
-    // ("...set RGB values to 00,33,00 (direct to mode 1)"). Mode 0 is a
-    // different, LEGO-predefined 11-color index instead; not used here --
-    // direct RGB is unambiguous and doesn't require guessing LEGO's index
-    // table.
+    // ("...set RGB values to 00,33,00 (direct to mode 1)"). CAVEAT (from
+    // that same spec passage): a mode-1 write can be accepted and stored
+    // without ever becoming VISIBLE if the port's currently *active* mode
+    // is still mode 0 -- the spec's own wording ("switching to mode 1
+    // will NOT set the 00,33,00...") implies mode 1 only renders once the
+    // port has actually been switched into it, which a bare
+    // WriteDirectModeData does not do. Confirmed as unreliable on our own
+    // hub: describe_port's queries (0x21/0x22) round-trip fine over the
+    // same write path, proving BLE delivery works, but a mode-1 LED write
+    // alone did not visibly change the light. Kept for completeness /
+    // future use (e.g. paired with a Port Input Format Setup switching
+    // the port to mode 1 first) but LED_MODE_COLOR below is the reliable
+    // path today.
     const val LED_MODE_RGB = 0x01
+
+    // RGB Light's Mode 0 ("COL O") -- LEGO's fixed 11-entry predefined
+    // color palette, one index byte. This is the path pylgbst's own
+    // README example uses (hub.led.set_color(COLOR_RED)) and the one
+    // node-poweredup's Color enum documents -- the actually-proven,
+    // widely-used way every other LWP client sets this LED, unlike mode 1
+    // above. This is what setHubLedColor()/HubConnector.setLedColor() use.
+    const val LED_MODE_COLOR = 0x00
+
+    /** LEGO's fixed Mode-0 color palette for the hub's RGB Light --
+     * matches node-poweredup's Color enum and pylgbst's COLORS list
+     * exactly (both independently document the same 11 indices), not
+     * this project's own guess. NONE (255) turns the LED off/idle
+     * (hands color control back to the hub's own firmware, e.g. its
+     * battery-low blink) rather than commanding black. */
+    object LedColor {
+        const val BLACK = 0
+        const val PINK = 1
+        const val PURPLE = 2
+        const val BLUE = 3
+        const val LIGHT_BLUE = 4
+        const val CYAN = 5
+        const val GREEN = 6
+        const val YELLOW = 7
+        const val ORANGE = 8
+        const val RED = 9
+        const val WHITE = 10
+        const val NONE = 255
+
+        val byName: Map<String, Int> = mapOf(
+            "BLACK" to BLACK, "PINK" to PINK, "PURPLE" to PURPLE, "BLUE" to BLUE,
+            "LIGHT_BLUE" to LIGHT_BLUE, "CYAN" to CYAN, "GREEN" to GREEN, "YELLOW" to YELLOW,
+            "ORANGE" to ORANGE, "RED" to RED, "WHITE" to WHITE, "NONE" to NONE,
+        )
+    }
 
     /** Builds one full LWP message: (Length, HubID=0, MessageType, payload...). */
     fun encodeMessage(messageType: Int, vararg payload: Int): ByteArray {
@@ -110,6 +154,9 @@ object Lwp {
 
     fun setHubLedRgb(r: Int, g: Int, b: Int): ByteArray =
         writeDirectModeData(HUB_LED_PORT, LED_MODE_RGB, r.coerceIn(0, 255), g.coerceIn(0, 255), b.coerceIn(0, 255))
+
+    fun setHubLedColor(colorIndex: Int): ByteArray =
+        writeDirectModeData(HUB_LED_PORT, LED_MODE_COLOR, colorIndex)
 
     /** Common Header's Message Type byte (offset 2), or null if too short to have one. */
     fun messageType(bytes: ByteArray): Int? = if (bytes.size >= 3) bytes[2].toInt() and 0xFF else null

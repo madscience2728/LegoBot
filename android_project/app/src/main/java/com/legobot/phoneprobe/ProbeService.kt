@@ -302,9 +302,12 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
     }
 
     /** Second of the two "actually talk LWP to the hub" commands -- see
-     * HubConnector.setLedRgb. This is the one whose success is visible on
-     * the hub itself (the LED changes color), not just in a log line --
-     * the whole reason it was picked as the first real *output* command. */
+     * HubConnector.setLedColor / setLedRgb. Accepts EITHER a named
+     * "color" (LEGO's Mode-0 palette, e.g. "GREEN" -- the reliable path,
+     * confirmed to actually change the physical LED) OR raw "r"/"g"/"b"
+     * (Mode-1 direct RGB -- spec-legal, NOT confirmed to render; see
+     * HubConnector.setLedRgb's doc comment for why). "color" wins if
+     * both are present. */
     private fun hubLed(session: IHTTPSession): JSONObject {
         if (session.method != Method.POST) {
             return JSONObject().put("status", "error").put("message", "/hub/led requires POST")
@@ -317,6 +320,14 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
         val connector = hubs[hubKey]
             ?: return JSONObject().put("status", "error")
                 .put("message", "unknown hub '$hubKey', expected one of ${hubs.keys.sorted()}")
+
+        val colorName = body.optString("color", "").trim().uppercase()
+        if (colorName.isNotEmpty()) {
+            val colorIndex = Lwp.LedColor.byName[colorName]
+                ?: return JSONObject().put("status", "error")
+                    .put("message", "unknown color '$colorName', expected one of ${Lwp.LedColor.byName.keys.sorted()}")
+            return runBlocking { connector.setLedColor(colorIndex) }
+        }
 
         val r = body.optInt("r", 0)
         val g = body.optInt("g", 0)

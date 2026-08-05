@@ -90,7 +90,39 @@
             <span class="hub-name"><b>front</b> <span class="addr">"Control+ Hub"</span></span>
             <button type="button" class="btn-disconnect hub-connect-btn" data-hub="front">Connect</button>
           </div>
+          <div class="hub-controls">
+            <select class="hub-port-select" data-hub="front">
+              <option value="A">A</option><option value="B">B</option>
+              <option value="C">C</option><option value="D">D</option>
+            </select>
+            <button type="button" class="btn-disconnect hub-describe-btn" data-hub="front">Describe port</button>
+          </div>
+          <div class="hub-controls">
+            <label class="hub-controls-label">LED</label>
+            <select class="hub-led-color-select" data-hub="front">
+              <option value="BLACK">black/off</option>
+              <option value="PINK">pink</option>
+              <option value="PURPLE">purple</option>
+              <option value="BLUE">blue</option>
+              <option value="LIGHT_BLUE">light blue</option>
+              <option value="CYAN">cyan</option>
+              <option value="GREEN" selected>green</option>
+              <option value="YELLOW">yellow</option>
+              <option value="ORANGE">orange</option>
+              <option value="RED">red</option>
+              <option value="WHITE">white</option>
+            </select>
+            <button type="button" class="btn-disconnect hub-led-color-btn" data-hub="front">Set color</button>
+          </div>
+          <div class="hub-controls">
+            <label class="hub-controls-label" title="Mode 1 direct RGB -- spec-legal but not confirmed to actually change the LED; the color dropdown above is the reliable one.">RGB&nbsp;<span class="experimental-tag">experimental</span></label>
+            <span class="rgb-field"><span class="rgb-field-label">R</span><input type="number" class="hub-rgb" data-hub="front" data-chan="r" min="0" max="255" value="0"></span>
+            <span class="rgb-field"><span class="rgb-field-label">G</span><input type="number" class="hub-rgb" data-hub="front" data-chan="g" min="0" max="255" value="255"></span>
+            <span class="rgb-field"><span class="rgb-field-label">B</span><input type="number" class="hub-rgb" data-hub="front" data-chan="b" min="0" max="255" value="0"></span>
+            <button type="button" class="btn-disconnect hub-led-btn" data-hub="front">Set RGB</button>
+          </div>
           <div class="hub-detail" id="hubDetail-front"></div>
+          <div class="hub-extra" id="hubExtra-front"></div>
         </li>
         <li class="hub-row" data-hub="rear">
           <div class="hub-row-top">
@@ -98,10 +130,42 @@
             <span class="hub-name"><b>rear</b> <span class="addr">"Daril"</span></span>
             <button type="button" class="btn-disconnect hub-connect-btn" data-hub="rear">Connect</button>
           </div>
+          <div class="hub-controls">
+            <select class="hub-port-select" data-hub="rear">
+              <option value="A">A</option><option value="B">B</option>
+              <option value="C">C</option><option value="D">D</option>
+            </select>
+            <button type="button" class="btn-disconnect hub-describe-btn" data-hub="rear">Describe port</button>
+          </div>
+          <div class="hub-controls">
+            <label class="hub-controls-label">LED</label>
+            <select class="hub-led-color-select" data-hub="rear">
+              <option value="BLACK">black/off</option>
+              <option value="PINK">pink</option>
+              <option value="PURPLE">purple</option>
+              <option value="BLUE">blue</option>
+              <option value="LIGHT_BLUE">light blue</option>
+              <option value="CYAN">cyan</option>
+              <option value="GREEN" selected>green</option>
+              <option value="YELLOW">yellow</option>
+              <option value="ORANGE">orange</option>
+              <option value="RED">red</option>
+              <option value="WHITE">white</option>
+            </select>
+            <button type="button" class="btn-disconnect hub-led-color-btn" data-hub="rear">Set color</button>
+          </div>
+          <div class="hub-controls">
+            <label class="hub-controls-label" title="Mode 1 direct RGB -- spec-legal but not confirmed to actually change the LED; the color dropdown above is the reliable one.">RGB&nbsp;<span class="experimental-tag">experimental</span></label>
+            <span class="rgb-field"><span class="rgb-field-label">R</span><input type="number" class="hub-rgb" data-hub="rear" data-chan="r" min="0" max="255" value="0"></span>
+            <span class="rgb-field"><span class="rgb-field-label">G</span><input type="number" class="hub-rgb" data-hub="rear" data-chan="g" min="0" max="255" value="255"></span>
+            <span class="rgb-field"><span class="rgb-field-label">B</span><input type="number" class="hub-rgb" data-hub="rear" data-chan="b" min="0" max="255" value="0"></span>
+            <button type="button" class="btn-disconnect hub-led-btn" data-hub="rear">Set RGB</button>
+          </div>
           <div class="hub-detail" id="hubDetail-rear"></div>
+          <div class="hub-extra" id="hubExtra-rear"></div>
         </li>
       </ul>
-      <div class="timing-note">Connect does a real BLE scan + GATT handshake on the phone (~10-25s) -- proves the link, doesn't drive any motors yet.</div>
+      <div class="timing-note">Connect does a real BLE scan + GATT handshake on the phone (~10-25s). Describe port and LED are real LWP commands once connected -- the color dropdown reliably changes the hub's status light; direct RGB is spec-legal but unconfirmed to render.</div>
     </section>
 
     <!-- TIMING -->
@@ -302,6 +366,16 @@ function handleMessage(msg) {
       }
       break;
     }
+
+    case 'port_info': {
+      renderPortInfo(msg.hub, msg.data);
+      break;
+    }
+
+    case 'led_result': {
+      renderLedResult(msg.hub, msg);
+      break;
+    }
   }
 }
 
@@ -326,6 +400,42 @@ function renderHubs(hubs) {
   }
   const totalConnected = Object.values(hubStates).filter(h => h.state === 'connected').length;
   setBadge(els.hubsBadge, `${totalConnected}/2 connected`, totalConnected === 2 ? 'ok' : '');
+}
+
+function renderPortInfo(hub, data) {
+  const el = $(`hubExtra-${hub}`);
+  if (!el) return;
+  if (data.status !== 'ok') {
+    el.innerHTML = `<div class="hub-extra-title">describe_port ${escapeHtml(data.port ?? '')} &mdash; error</div>
+      <div class="hub-extra-err">${escapeHtml(data.message ?? 'failed')}</div>`;
+    return;
+  }
+  const rows = (data.modes ?? []).map(m => {
+    const range = (m.raw_min != null && m.raw_max != null) ? `${m.raw_min}&ndash;${m.raw_max}` : '--';
+    const io = [m.input ? 'in' : null, m.output ? 'out' : null].filter(Boolean).join('/') || '--';
+    return `<div class="mode-row">
+      <span class="mode-num">${m.mode}</span>
+      <span class="mode-name">${escapeHtml(m.name ?? '(unnamed)')}</span>
+      <span class="mode-range">${range}</span>
+      <span class="mode-io">${io}</span>
+    </div>`;
+  }).join('');
+  el.innerHTML = `<div class="hub-extra-title">port ${escapeHtml(data.port)} &mdash; ${data.modes.length} of ${data.total_mode_count} mode(s)</div>
+    <div class="mode-table">${rows || '<div class="mode-row">(no modes reported)</div>'}</div>`;
+}
+
+function renderLedResult(hub, msg) {
+  const el = $(`hubExtra-${hub}`);
+  if (!el) return;
+  if (msg.data.status !== 'ok') {
+    el.innerHTML = `<div class="hub-extra-title">LED &mdash; error</div><div class="hub-extra-err">${escapeHtml(msg.data.message ?? 'failed')}</div>`;
+    return;
+  }
+  if (msg.color) {
+    el.innerHTML = `<div class="hub-extra-title">LED set to <span class="led-swatch swatch-${escapeHtml(msg.color)}"></span> ${escapeHtml(msg.color.toLowerCase())}</div>`;
+  } else {
+    el.innerHTML = `<div class="hub-extra-title">LED (rgb, experimental) set <span class="led-swatch" style="background:rgb(${msg.r},${msg.g},${msg.b})"></span> rgb(${msg.r}, ${msg.g}, ${msg.b})</div>`;
+  }
 }
 
 const commandHistory = [];
@@ -419,12 +529,15 @@ fetch('/api/status').then(r => r.json()).then(s => {
 // server (single source of truth on the PC side) rather than hardcoded
 // a third time here; the hint args below are just a convenience
 // starting point for each command's usual shape, not validated.
+//
+// describe_port is NOT in this list -- it's a real dispatched command
+// now (see the Hubs panel's "Describe port" button), not part of the
+// dummy /command channel this console talks to.
 const ARGS_HINTS = {
   stop: { port: 'A' },
   set_speed: { port: 'A', speed: 0.4 },
   read_angle: { port: 'A' },
   preset_zero: { port: 'A' },
-  describe_port: { port: 'A' },
   read_apos: { port: 'A' },
   home_angle: { port: 'A', target_degrees: 0 },
   set_position: { port: 'A', target_degrees: 90 },
@@ -498,6 +611,81 @@ document.querySelectorAll('.hub-connect-btn').forEach(btn => {
       alert(`request failed: ${err}`);
     } finally {
       btn.disabled = false;
+    }
+  });
+});
+
+document.querySelectorAll('.hub-describe-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const hub = btn.dataset.hub;
+    const port = document.querySelector(`.hub-port-select[data-hub="${hub}"]`).value;
+    const el = $(`hubExtra-${hub}`);
+    btn.disabled = true;
+    btn.textContent = 'Describing…';
+    if (el) el.innerHTML = `<div class="hub-extra-title">describe_port ${escapeHtml(port)} &mdash; querying…</div>`;
+    try {
+      const resp = await fetch('/api/hub/describe_port', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hub, port }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) alert(data.message || `request failed (${resp.status})`);
+      // rendering happens via the 'port_info' broadcast on /ws
+    } catch (err) {
+      alert(`request failed: ${err}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Describe port';
+    }
+  });
+});
+
+document.querySelectorAll('.hub-led-color-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const hub = btn.dataset.hub;
+    const color = document.querySelector(`.hub-led-color-select[data-hub="${hub}"]`).value;
+    btn.disabled = true;
+    btn.textContent = 'Setting…';
+    try {
+      const resp = await fetch('/api/hub/led', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hub, color }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) alert(data.message || `request failed (${resp.status})`);
+      // rendering happens via the 'led_result' broadcast on /ws
+    } catch (err) {
+      alert(`request failed: ${err}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Set color';
+    }
+  });
+});
+
+document.querySelectorAll('.hub-led-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const hub = btn.dataset.hub;
+    const chan = (name) => Number(document.querySelector(`.hub-rgb[data-hub="${hub}"][data-chan="${name}"]`).value) || 0;
+    const r = chan('r'), g = chan('g'), b = chan('b');
+    btn.disabled = true;
+    btn.textContent = 'Setting…';
+    try {
+      const resp = await fetch('/api/hub/led', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hub, r, g, b }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) alert(data.message || `request failed (${resp.status})`);
+      // rendering happens via the 'led_result' broadcast on /ws
+    } catch (err) {
+      alert(`request failed: ${err}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Set RGB';
     }
   });
 });

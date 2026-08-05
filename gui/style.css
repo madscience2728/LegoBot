@@ -515,3 +515,147 @@ footer {
   overflow-wrap: anywhere;
   min-height: 1.2em;
 }
+
+.hub-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.hub-controls-label {
+  font-size: 11px;
+  color: var(--ink-dim);
+  min-width: 28px;
+}
+
+.experimental-tag {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--amber);
+  border: 1px solid var(--amber-dim);
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+
+.hub-led-color-select {
+  background: #0f1114;
+  border: 1px solid var(--panel-border);
+  color: var(--ink);
+  border-radius: 5px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 4px 6px;
+}
+
+.hub-led-color-select:focus {
+  outline: none;
+  border-color: var(--amber-dim);
+}
+
+.hub-led-color-btn {
+  font-size: 11px;
+  padding: 5px 10px;
+}
+
+.rgb-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.rgb-field-label {
+  font-size: 10px;
+  color: var(--ink-dim);
+}
+
+.hub-port-select,
+.hub-rgb {
+  background: #0f1114;
+  border: 1px solid var(--panel-border);
+  color: var(--ink);
+  border-radius: 5px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  padding: 4px 6px;
+}
+
+.hub-port-select:focus,
+.hub-rgb:focus {
+  outline: none;
+  border-color: var(--amber-dim);
+}
+
+.hub-rgb {
+  width: 58px;
+}
+
+.hub-describe-btn,
+.hub-led-btn {
+  font-size: 11px;
+  padding: 5px 10px;
+}
+
+.hub-extra {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-dim);
+}
+
+.hub-extra-title {
+  margin-top: 2px;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.hub-extra-err {
+  color: var(--red);
+}
+
+.led-swatch {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  border: 1px solid var(--panel-border);
+  vertical-align: middle;
+}
+
+/* Approximate renderings of LEGO's Mode-0 indexed LED colors, for the
+   swatch next to the "LED set to ..." confirmation -- these are visual
+   approximations for the dashboard, not the hub's actual LED die colors. */
+.swatch-BLACK { background: #1a1a1a; }
+.swatch-PINK { background: #ff6fae; }
+.swatch-PURPLE { background: #8a3ffc; }
+.swatch-BLUE { background: #2f6fed; }
+.swatch-LIGHT_BLUE { background: #4fb3e8; }
+.swatch-CYAN { background: #29c6d6; }
+.swatch-GREEN { background: #3fae4a; }
+.swatch-YELLOW { background: #f2d43d; }
+.swatch-ORANGE { background: #f2942d; }
+.swatch-RED { background: #e14b3f; }
+.swatch-WHITE { background: #f2f2ee; }
+
+.mode-table {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+}
+
+.mode-row {
+  display: flex;
+  gap: 8px;
+  padding: 3px 6px;
+  background: #0f1114;
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+}
+
+.mode-num { color: var(--amber); min-width: 14px; }
+.mode-name { flex: 1 1 auto; color: var(--ink); }
+.mode-range { color: var(--ink-dim); }
+.mode-io { color: var(--cyan); min-width: 30px; text-align: right; }
