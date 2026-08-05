@@ -16,6 +16,8 @@ import android.bluetooth.BluetoothStatusCodes
 import android.os.Build
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
@@ -308,21 +310,55 @@ class HubConnector(private val context: Context, val hubName: String, val label:
     //   - setLedRgb: Mode-1 direct RGB, spec-legal but NOT confirmed to
     //     render on our hub -- see its own doc comment.
 
+    // Serializes every write to this hub's single GATT connection.
+    // Android's BluetoothGatt allows exactly ONE operation in flight at
+    // a time -- calling writeCharacteristic() again before the previous
+    // one has settled doesn't queue politely, it returns a busy failure
+    // (BluetoothStatusCodes.ERROR_GATT_WRITE_REQUEST_BUSY on API 33+,
+    // or a bare `false` on the legacy path). That's exactly what
+    // produced the "some drive commands only move 2 or 3 wheels" and
+    // "tilt_head_down — BLE write failed" symptoms: DriveController's
+    // per-wheel loop (two wheels sharing this same connector) and
+    // rapid-fire button presses were issuing writes back-to-back with
+    // no pacing, and a busy status was being treated as a hard failure
+    // instead of "try again in a moment". This mutex plus the retry
+    // loop in writeToHub fixes both at the root, rather than requiring
+    // every caller to remember to add its own delay.
+    private val writeMutex = Mutex()
+
     @SuppressLint("MissingPermission") // caller (ProbeService) verifies permissions first
-    private fun writeToHub(bytes: ByteArray): Boolean {
-        val g = gatt ?: return false
-        val char = hubChar ?: return false
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            g.writeCharacteristic(char, bytes, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) ==
-                BluetoothStatusCodes.SUCCESS
-        } else {
-            @Suppress("DEPRECATION") // pre-API33 write path -- minSdk 26 needs this
-            char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            @Suppress("DEPRECATION")
-            char.value = bytes
-            @Suppress("DEPRECATION")
-            g.writeCharacteristic(char)
+    private suspend fun writeToHub(bytes: ByteArray, maxAttempts: Int = 5): Boolean = writeMutex.withLock {
+        val g = gatt ?: return@withLock false
+        val char = hubChar ?: return@withLock false
+
+        var attempt = 0
+        while (attempt < maxAttempts) {
+            val queued = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                g.writeCharacteristic(char, bytes, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) ==
+                    BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION") // pre-API33 write path -- minSdk 26 needs this
+                char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                @Suppress("DEPRECATION")
+                char.value = bytes
+                @Suppress("DEPRECATION")
+                g.writeCharacteristic(char)
+            }
+            if (queued) {
+                // Small settle delay before releasing the mutex -- gives
+                // the stack a moment to actually drain this write before
+                // the next queued caller's write is attempted, which is
+                // what "queued successfully" alone doesn't guarantee.
+                delay(20)
+                return@withLock true
+            }
+            attempt++
+            if (attempt < maxAttempts) {
+                delay(25L * attempt) // 25ms, 50ms, 75ms, 100ms backoff
+            }
         }
+        CommandBus.post("[$label] x write failed after $maxAttempts attempts (GATT busy)")
+        false
     }
 
     /** Writes an LWP message and waits for the next notification whose
