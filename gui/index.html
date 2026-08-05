@@ -84,7 +84,7 @@
 
     <!-- VOICE -->
     <section class="panel p-voice">
-      <h2>Voice <span class="badge" id="voiceBadge">--</span></h2>
+      <h2>Voice <span class="badge" id="voiceBadge">--</span> <span class="addr" id="voiceName"></span></h2>
       <div class="hub-controls">
         <input type="text" class="face-emoji-input" id="voiceTextInput" placeholder="what should it say?" style="flex:1;">
         <label class="hub-controls-label" style="display:flex;align-items:center;gap:4px;">
@@ -343,7 +343,7 @@ const els = {
   cmdBadge: $('cmdBadge'), cmdLog: $('cmdLog'),
   hubsBadge: $('hubsBadge'),
   faceBadge: $('faceBadge'), faceDisplay: $('faceDisplay'), faceExprSelect: $('faceExprSelect'),
-  voiceBadge: $('voiceBadge'),
+  voiceBadge: $('voiceBadge'), voiceName: $('voiceName'),
 };
 
 // ---- sparkline helper (plain canvas, no deps) ----
@@ -612,6 +612,7 @@ function renderVoiceStatus(data) {
   } else {
     setBadge(els.voiceBadge, 'ready', 'ok');
   }
+  if (els.voiceName) els.voiceName.textContent = data.voice ? `"${data.voice}"` : '';
 }
 
 function renderVoiceResult(msg) {
