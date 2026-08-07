@@ -33,6 +33,12 @@ AUDIO_FRAME_BYTES = int(AUDIO_SAMPLE_RATE * AUDIO_FRAME_MS / 1000) * 2  # 960 by
 PREROLL_FRAMES = 10   # ~300ms kept before a trigger, in case speech starts there
 HANGOVER_FRAMES = 20  # ~600ms of continued silence tolerated before closing out
 VAD_AGGRESSIVENESS = 2  # 0 (permissive) - 3 (strict); 2 is a reasonable default
+# Safety valve, not a real duration limit -- an utterance running this
+# long almost certainly means the VAD got latched onto something that
+# isn't actually a single spoken utterance (most likely the robot's own
+# TTS bleeding into its mic). ~15s of continuous "speech" force-emits
+# and resets rather than growing forever. See process()'s comment.
+MAX_UTTERANCE_FRAMES = 500  # ~15s at 30ms/frame
 
 
 class Segmenter:
@@ -80,6 +86,20 @@ class Segmenter:
                 self._triggered = False
                 self._voiced = []
                 self._silence_run = 0
+            return
+
+        if len(self._voiced) >= MAX_UTTERANCE_FRAMES:
+            # Safety valve: force-emit and reset rather than staying
+            # triggered forever. Without this, any sustained run of
+            # frames the VAD classifies as continuous speech -- the
+            # robot picking up its own TTS through its own mic being
+            # the leading suspect, but any cause -- would grow _voiced
+            # without bound and never emit again, which looks exactly
+            # like "it only heard audio once and then stopped."
+            self._emit(b"".join(self._voiced))
+            self._triggered = False
+            self._voiced = []
+            self._silence_run = 0
 
     def flush(self):
         """Call on disconnect so an in-progress utterance isn't lost

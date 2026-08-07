@@ -217,6 +217,11 @@ class State:
         # button); run_llm_service() waits on this to skip its normal
         # auto-retry delay and try again immediately.
         self.llm_retry_event: asyncio.Event = asyncio.Event()
+        # See _mute_mic_while_speaking() -- True while the phone is
+        # (believed to be) actively speaking a TTS utterance, so
+        # incoming audio frames are still level-metered for the UI but
+        # skipped by the VAD segmenter during that window.
+        self.mic_muted: bool = False
 
     def _on_utterance(self, pcm_bytes: bytes):
         self.last_utterance_wav = pcm_to_wav_bytes(pcm_bytes)
@@ -309,7 +314,8 @@ async def media_relay_loop(ip: str):
 
                     elif msg_type == TYPE_AUDIO:
                         state.audio_timing.record(latency_ms)
-                        state.segmenter.process(payload)
+                        if not state.mic_muted:
+                            state.segmenter.process(payload)
                         level, dbfs = pcm16_level(payload)
                         nowm = time.monotonic()
                         if nowm - last_audio_broadcast >= 1.0 / AUDIO_BROADCAST_HZ:
@@ -957,8 +963,45 @@ async def api_voice_say(payload: dict):
     except Exception as exc:
         data = {"status": "error", "message": str(exc)}
 
+    if data.get("status") == "ok":
+        # Mute audio segmentation for roughly as long as this utterance
+        # is actually playing -- prevents the robot's own TTS (heard
+        # through its own mic, no hardware echo cancellation on
+        # AudioSource.MIC) from either being misread as user speech or
+        # latching the VAD into a stuck state. See segmenter.py's
+        # MAX_UTTERANCE_FRAMES for the backstop if this ever misses.
+        asyncio.create_task(_mute_mic_while_speaking())
+
     await broadcast({"type": "voice_result", "text": text, "interrupt": interrupt, "data": data})
     return data
+
+
+async def _mute_mic_while_speaking(poll_interval_s: float = 0.25, max_wait_s: float = 20.0):
+    """Sets state.mic_muted True immediately, then polls the phone's
+    own /voice/status (VoiceController.statusJson()'s "speaking" field)
+    until it reports done, or max_wait_s elapses as a hard backstop in
+    case that polling itself fails silently. Always clears mic_muted in
+    a finally so a network hiccup mid-utterance can't leave the mic
+    muted forever.
+    """
+    state.mic_muted = True
+    try:
+        if not state.phone_ip:
+            return
+        url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/voice/status"
+        waited = 0.0
+        while waited < max_wait_s:
+            await asyncio.sleep(poll_interval_s)
+            waited += poll_interval_s
+            try:
+                resp = await asyncio.to_thread(requests.get, url, timeout=5)
+                data = resp.json()
+            except Exception:
+                continue  # transient poll failure -- keep trying until max_wait_s
+            if not data.get("speaking", False):
+                return
+    finally:
+        state.mic_muted = False
 
 
 @app.post("/api/voice/stop")

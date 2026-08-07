@@ -22,7 +22,12 @@ from .schema import (
 )
 
 _OUTPUT_SHAPE_EXAMPLE = {
-    "speech_out": "what you want to say here",
+    "speech_out": (
+        "what you want to say here, OR an empty string \"\" to stay "
+        "silent this turn (the same idea as drive.direction=STATIONARY "
+        "-- silence is a valid, explicit choice, not something you "
+        "have to fill with filler words)"
+    ),
     "next_expression": f"[one of: {', '.join(sorted(EXPRESSIONS))}]",
     "next_head_orientation": f"[one of: {', '.join(sorted(HEAD_ORIENTATIONS))}]",
     "drive": {

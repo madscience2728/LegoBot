@@ -122,7 +122,7 @@ def validate_and_clamp(data: Any) -> tuple[Action | None, list[str]]:
         duration = _clamp(duration, *dur_range)
 
     action = Action(
-        speech_out=str(speech_out),
+        speech_out=str(speech_out).strip(),
         next_expression=expression,
         next_head_orientation=head,
         drive=Drive(direction=direction, speed=speed, duration=duration),

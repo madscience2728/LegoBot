@@ -42,6 +42,7 @@ from typing import Callable, Optional
 # imports below only work in the second case.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.adapter.dispatch import DispatchResult
 from src.adapter.docker_gemma4_adapter import DockerGemma4Adapter, DockerServerUnavailable
 from src.adapter.tick_loop import run_forever
 from src.adapter.tick_runner import TickRunResult
@@ -77,7 +78,7 @@ def _build_state() -> dict:
     return dict(_SAMPLE_STATE)
 
 
-def _print_tick(result: TickRunResult) -> None:
+def _print_tick(result: TickRunResult, dispatch_result: Optional[DispatchResult]) -> None:
     print()
     senses_str = f"vision={'yes' if result.had_vision else 'NO'} audio={'yes' if result.had_audio else 'NO'}"
     print(f"senses this tick: {senses_str}")
@@ -85,6 +86,16 @@ def _print_tick(result: TickRunResult) -> None:
     if result.tick.ok:
         print(f"[TICK OK] used_autofix={result.tick.used_autofix}")
         print(f"action: {result.tick.action}")
+        if dispatch_result is not None:
+            if dispatch_result.voice_skipped_silent:
+                print("[DISPATCHED] face sent, speech skipped (model chose to stay silent)")
+            elif dispatch_result.ok:
+                print("[DISPATCHED] face + voice sent to phone")
+            else:
+                if not dispatch_result.face_ok:
+                    print(f"[DISPATCH FAILED] face: {dispatch_result.face_error}")
+                if not dispatch_result.voice_ok:
+                    print(f"[DISPATCH FAILED] voice: {dispatch_result.voice_error}")
     else:
         print(f"[TICK REJECTED] errors: {result.tick.errors}")
         print(f"raw: {result.tick.raw!r}")
