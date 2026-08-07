@@ -30,7 +30,7 @@ private val KNOWN_COMMANDS = setOf(
     "stop", "set_speed", "read_angle", "preset_zero",
     "read_apos", "home_angle", "set_position", "goto_angle",
 )
-private val KNOWN_HUBS = setOf("front", "rear")
+private val KNOWN_HUBS = setOf("front")
 
 /**
  * Runs ON THE PHONE -- this is the phone-side equivalent of
@@ -126,12 +126,14 @@ private class ProbeServer(private val context: android.content.Context) : NanoHT
     private val micProbe = MicProbe(context)
     private val commandLog = CommandLog()
 
-    // Names match old/src/lego_pi/relay_server.py's FRONT_HUB_NAME /
-    // REAR_HUB_NAME defaults exactly -- these are the actual BLE
-    // advertised names the two physical hubs use, not placeholders.
+    // Single hub as of the chassis rebuild -- there used to be a second
+    // "Daril" hub here (rear), but the rebuild consolidated everything
+    // onto one "Control+ Hub". Kept the "front" label rather than
+    // renaming it, since that's the smaller diff and nothing about the
+    // label is user-facing (WheelMap.kt, the GUI, etc. all just refer to
+    // "front" as "the hub" now).
     private val hubs = mapOf(
         "front" to HubConnector(context, hubName = "Control+ Hub", label = "front"),
-        "rear" to HubConnector(context, hubName = "Daril", label = "rear"),
     )
 
     // The actual command surface a future LLM's tool calls will use --

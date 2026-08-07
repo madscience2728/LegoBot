@@ -118,7 +118,7 @@
 
     <!-- HUBS -->
     <section class="panel p-hubs">
-      <h2>Hubs <span class="badge" id="hubsBadge">0/2 connected</span></h2>
+      <h2>Hubs <span class="badge" id="hubsBadge">not connected</span></h2>
       <ul class="hub-list" id="hubList">
         <li class="hub-row" data-hub="front">
           <div class="hub-row-top">
@@ -160,46 +160,6 @@
           <div class="hub-detail" id="hubDetail-front"></div>
           <div class="hub-extra" id="hubExtra-front"></div>
         </li>
-        <li class="hub-row" data-hub="rear">
-          <div class="hub-row-top">
-            <span class="badge" id="hubBadge-rear">unknown</span>
-            <span class="hub-name"><b>rear</b> <span class="addr">"Daril"</span></span>
-            <button type="button" class="btn-disconnect hub-connect-btn" data-hub="rear">Connect</button>
-          </div>
-          <div class="hub-controls">
-            <select class="hub-port-select" data-hub="rear">
-              <option value="A">A</option><option value="B">B</option>
-              <option value="C">C</option><option value="D">D</option>
-            </select>
-            <button type="button" class="btn-disconnect hub-describe-btn" data-hub="rear">Describe port</button>
-          </div>
-          <div class="hub-controls">
-            <label class="hub-controls-label">LED</label>
-            <select class="hub-led-color-select" data-hub="rear">
-              <option value="BLACK">black/off</option>
-              <option value="PINK">pink</option>
-              <option value="PURPLE">purple</option>
-              <option value="BLUE">blue</option>
-              <option value="LIGHT_BLUE">light blue</option>
-              <option value="CYAN">cyan</option>
-              <option value="GREEN" selected>green</option>
-              <option value="YELLOW">yellow</option>
-              <option value="ORANGE">orange</option>
-              <option value="RED">red</option>
-              <option value="WHITE">white</option>
-            </select>
-            <button type="button" class="btn-disconnect hub-led-color-btn" data-hub="rear">Set color</button>
-          </div>
-          <div class="hub-controls">
-            <label class="hub-controls-label" title="Mode 1 direct RGB -- spec-legal but not confirmed to actually change the LED; the color dropdown above is the reliable one.">RGB&nbsp;<span class="experimental-tag">experimental</span></label>
-            <span class="rgb-field"><span class="rgb-field-label">R</span><input type="number" class="hub-rgb" data-hub="rear" data-chan="r" min="0" max="255" value="0"></span>
-            <span class="rgb-field"><span class="rgb-field-label">G</span><input type="number" class="hub-rgb" data-hub="rear" data-chan="g" min="0" max="255" value="255"></span>
-            <span class="rgb-field"><span class="rgb-field-label">B</span><input type="number" class="hub-rgb" data-hub="rear" data-chan="b" min="0" max="255" value="0"></span>
-            <button type="button" class="btn-disconnect hub-led-btn" data-hub="rear">Set RGB</button>
-          </div>
-          <div class="hub-detail" id="hubDetail-rear"></div>
-          <div class="hub-extra" id="hubExtra-rear"></div>
-        </li>
       </ul>
       <div class="timing-note">Connect does a real BLE scan + GATT handshake on the phone (~10-25s). Describe port and LED are real LWP commands once connected -- the color dropdown reliably changes the hub's status light; direct RGB is spec-legal but unconfirmed to render.</div>
     </section>
@@ -226,31 +186,19 @@
 
     <!-- WHEELS -->
     <section class="panel p-wheels">
-      <h2>Wheels &amp; Servo <span class="badge ok">right side inverted</span></h2>
+      <h2>Wheels &amp; Servo <span class="badge ok">right wheel inverted</span></h2>
       <ul class="wheel-list" id="wheelList">
-        <li class="wheel-row" data-part="front_left_wheel">
-          <span class="wheel-name">front-left <span class="addr">rear&nbsp;D</span></span>
-          <input type="number" class="wheel-speed" data-part="front_left_wheel" min="-1" max="1" step="0.1" value="0.3">
-          <button type="button" class="btn-disconnect wheel-run-btn" data-part="front_left_wheel">Run</button>
-          <button type="button" class="btn-disconnect wheel-stop-btn" data-part="front_left_wheel">Stop</button>
+        <li class="wheel-row" data-part="left_wheel">
+          <span class="wheel-name">left <span class="addr">front&nbsp;C</span></span>
+          <input type="number" class="wheel-speed" data-part="left_wheel" min="-1" max="1" step="0.1" value="0.3">
+          <button type="button" class="btn-disconnect wheel-run-btn" data-part="left_wheel">Run</button>
+          <button type="button" class="btn-disconnect wheel-stop-btn" data-part="left_wheel">Stop</button>
         </li>
-        <li class="wheel-row" data-part="front_right_wheel">
-          <span class="wheel-name">front-right <span class="addr">front&nbsp;C</span> <span class="invert-tag">inverted</span></span>
-          <input type="number" class="wheel-speed" data-part="front_right_wheel" min="-1" max="1" step="0.1" value="0.3">
-          <button type="button" class="btn-disconnect wheel-run-btn" data-part="front_right_wheel">Run</button>
-          <button type="button" class="btn-disconnect wheel-stop-btn" data-part="front_right_wheel">Stop</button>
-        </li>
-        <li class="wheel-row" data-part="rear_left_wheel">
-          <span class="wheel-name">rear-left <span class="addr">rear&nbsp;B</span></span>
-          <input type="number" class="wheel-speed" data-part="rear_left_wheel" min="-1" max="1" step="0.1" value="0.3">
-          <button type="button" class="btn-disconnect wheel-run-btn" data-part="rear_left_wheel">Run</button>
-          <button type="button" class="btn-disconnect wheel-stop-btn" data-part="rear_left_wheel">Stop</button>
-        </li>
-        <li class="wheel-row" data-part="rear_right_wheel">
-          <span class="wheel-name">rear-right <span class="addr">front&nbsp;A</span> <span class="invert-tag">inverted</span></span>
-          <input type="number" class="wheel-speed" data-part="rear_right_wheel" min="-1" max="1" step="0.1" value="0.3">
-          <button type="button" class="btn-disconnect wheel-run-btn" data-part="rear_right_wheel">Run</button>
-          <button type="button" class="btn-disconnect wheel-stop-btn" data-part="rear_right_wheel">Stop</button>
+        <li class="wheel-row" data-part="right_wheel">
+          <span class="wheel-name">right <span class="addr">front&nbsp;A</span> <span class="invert-tag">inverted</span></span>
+          <input type="number" class="wheel-speed" data-part="right_wheel" min="-1" max="1" step="0.1" value="0.3">
+          <button type="button" class="btn-disconnect wheel-run-btn" data-part="right_wheel">Run</button>
+          <button type="button" class="btn-disconnect wheel-stop-btn" data-part="right_wheel">Stop</button>
         </li>
         <li class="wheel-row" data-part="head_tilt_servo">
           <span class="wheel-name">head-tilt servo <span class="addr">front&nbsp;B</span></span>
@@ -260,7 +208,7 @@
         </li>
       </ul>
       <div class="wheel-result" id="wheelResult"></div>
-      <div class="timing-note">Speed is -1.0..1.0. front-right and rear-right now get their speed negated on the phone (WheelMap.kt) before sending, so positive speed on every wheel should now mean the same physical direction -- confirmed by hand: left side needed no correction, right side did, head-tilt servo needed none either.</div>
+      <div class="timing-note">2-wheel-drive rebuild (single hub). Speed is -1.0..1.0. The right wheel gets its speed negated on the phone (WheelMap.kt) before sending, so positive speed on either wheel now means the same physical direction -- confirmed by hand after the rebuild: port C (left) needed no correction, port A (right) did, the head-tilt servo (port B) needed none either. Tilt "center/forward" preset is -7&deg;, not 0 -- the mount's weight tilts it forward a bit at rest, so true level isn't the servo's zero point. Up (-45) and down (+45) are unchanged, full-extent targets.</div>
     </section>
 
     <!-- DRIVE -->
@@ -287,7 +235,7 @@
             <div class="drive-group-label">head tilt &mdash; fixed presets, no speed/duration</div>
             <div class="drive-row">
               <button type="button" class="btn-connect drive-btn" data-command="tilt_head_up">Look Up (-45)</button>
-              <button type="button" class="btn-connect drive-btn" data-command="tilt_head_center">Forward (0)</button>
+              <button type="button" class="btn-connect drive-btn" data-command="tilt_head_center">Forward (-7)</button>
               <button type="button" class="btn-connect drive-btn" data-command="tilt_head_down">Look Down (+45)</button>
             </div>
           </div>
@@ -510,9 +458,11 @@ function handleMessage(msg) {
   }
 }
 
-const hubStates = {}; // persistent cache -- merges partial updates (e.g. a single-hub
-// connect result only reports THAT hub) so the "N/2 connected" badge is always
-// computed from everything known so far, not just the last message received.
+const hubStates = {}; // persistent cache -- merges partial updates so the
+// badge is always computed from everything known so far, not just the
+// last message received. Only one hub now, but kept as a keyed cache
+// (not a single variable) since it costs nothing and survives a second
+// hub coming back later without another refactor.
 
 function renderHubs(hubs) {
   Object.assign(hubStates, hubs);
@@ -530,7 +480,7 @@ function renderHubs(hubs) {
     if (btn) btn.textContent = state === 'connected' ? 'Disconnect' : 'Connect';
   }
   const totalConnected = Object.values(hubStates).filter(h => h.state === 'connected').length;
-  setBadge(els.hubsBadge, `${totalConnected}/2 connected`, totalConnected === 2 ? 'ok' : '');
+  setBadge(els.hubsBadge, totalConnected >= 1 ? 'connected' : 'not connected', totalConnected >= 1 ? 'ok' : '');
 }
 
 function renderPortInfo(hub, data) {

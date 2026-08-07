@@ -105,7 +105,7 @@ KNOWN_COMMANDS = {
 class CommandRequest(BaseModel):
     cmd: str
     args: dict = Field(default_factory=dict)
-    hub: Literal["front", "rear"] = "front"
+    hub: Literal["front"] = "front"
 
     @field_validator("cmd")
     @classmethod
@@ -432,7 +432,7 @@ async def api_status():
 
 @app.get("/api/commands/known")
 async def api_known_commands():
-    return {"commands": sorted(KNOWN_COMMANDS), "hubs": ["front", "rear"]}
+    return {"commands": sorted(KNOWN_COMMANDS), "hubs": ["front"]}
 
 
 @app.post("/api/command")
@@ -502,8 +502,8 @@ async def api_hub_connect(payload: dict):
         return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
 
     hub = (payload or {}).get("hub", "").strip().lower()
-    if hub not in ("front", "rear"):
-        return JSONResponse({"status": "error", "message": "hub must be 'front' or 'rear'."}, status_code=400)
+    if hub != "front":
+        return JSONResponse({"status": "error", "message": "hub must be 'front' (single hub now, since the rebuild)."}, status_code=400)
 
     url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/hub/connect"
     try:
@@ -533,8 +533,8 @@ async def api_hub_disconnect(payload: dict):
         return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
 
     hub = (payload or {}).get("hub", "").strip().lower()
-    if hub not in ("front", "rear"):
-        return JSONResponse({"status": "error", "message": "hub must be 'front' or 'rear'."}, status_code=400)
+    if hub != "front":
+        return JSONResponse({"status": "error", "message": "hub must be 'front' (single hub now, since the rebuild)."}, status_code=400)
 
     url = f"http://{state.phone_ip}:{PROBE_HTTP_PORT}/hub/disconnect"
     try:
@@ -588,8 +588,8 @@ async def api_hub_describe_port(payload: dict):
         return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
 
     hub = (payload or {}).get("hub", "").strip().lower()
-    if hub not in ("front", "rear"):
-        return JSONResponse({"status": "error", "message": "hub must be 'front' or 'rear'."}, status_code=400)
+    if hub != "front":
+        return JSONResponse({"status": "error", "message": "hub must be 'front' (single hub now, since the rebuild)."}, status_code=400)
     port = (payload or {}).get("port", "").strip().upper()
     if port not in ("A", "B", "C", "D"):
         return JSONResponse({"status": "error", "message": "port must be one of A, B, C, D."}, status_code=400)
@@ -625,8 +625,8 @@ async def api_hub_led(payload: dict):
         return JSONResponse({"status": "error", "message": "Not connected to a phone."}, status_code=400)
 
     hub = (payload or {}).get("hub", "").strip().lower()
-    if hub not in ("front", "rear"):
-        return JSONResponse({"status": "error", "message": "hub must be 'front' or 'rear'."}, status_code=400)
+    if hub != "front":
+        return JSONResponse({"status": "error", "message": "hub must be 'front' (single hub now, since the rebuild)."}, status_code=400)
 
     color = str((payload or {}).get("color", "")).strip().upper()
     if color:
@@ -665,8 +665,7 @@ async def api_hub_led(payload: dict):
 # phone (WheelMap.kt), not here, so this set intentionally doesn't
 # mirror the invert flags too.
 WHEEL_PARTS = {
-    "front_left_wheel", "front_right_wheel",
-    "rear_left_wheel", "rear_right_wheel",
+    "left_wheel", "right_wheel",
     "head_tilt_servo",
 }
 

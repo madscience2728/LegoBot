@@ -17,16 +17,21 @@ import kotlin.math.abs
  * "ask, don't guess" reasoning as the wheel invert flags and the LED
  * mode fix:
  *
- *   - Turns are a pivot in place: the left side reverses while the
- *     right side drives forward (turn_left), or vice versa (turn_right)
- *     -- NOT an arc turn where one side just stops.
+ *   - Turns are a pivot in place: the left wheel reverses while the
+ *     right wheel drives forward (turn_left), or vice versa (turn_right)
+ *     -- NOT an arc turn where one side just stops. (2-wheel-drive
+ *     rebuild -- there's only one wheel per side now, not two.)
  *   - Head tilt is three fixed absolute presets via APOS, not a
- *     relative nudge: tilt_head_up is always exactly -45 degrees,
- *     tilt_head_down is always exactly +45, tilt_head_center is always
- *     0. speed/duration are deliberately NOT parameters for tilt (unlike
- *     the wheel commands) -- there's no "how far" to specify beyond the
- *     fixed target, since this is an absolute bounded move via gotoApos,
- *     not an open-loop timed run like the wheel commands are.
+ *     relative nudge: tilt_head_up is -45 degrees, tilt_head_down is
+ *     +45. tilt_head_center/forward is -7, NOT 0 -- the mount's weight
+ *     tilts it forward a bit at rest, so true "looking level" isn't the
+ *     servo's zero point; -7 is the confirmed compensation for that
+ *     droop. Only center needed this correction -- up/down are the
+ *     original full-extent symmetric targets, unchanged. speed/duration
+ *     are deliberately NOT parameters for tilt (unlike the wheel
+ *     commands) -- there's no "how far" to specify beyond the fixed
+ *     target, since this is an absolute bounded move via gotoApos, not
+ *     an open-loop timed run like the wheel commands are.
  */
 class DriveController(private val hubs: Map<String, HubConnector>) {
 
@@ -36,9 +41,9 @@ class DriveController(private val hubs: Map<String, HubConnector>) {
         return connector to wiring
     }
 
-    /** Drives all four wheels the same physical direction for
-     * durationS seconds -- go_forward and go_back share this, since the
-     * only difference between them is the sign of speed. */
+    /** Drives both wheels the same physical direction for durationS
+     * seconds -- go_forward and go_back share this, since the only
+     * difference between them is the sign of speed. */
     private suspend fun driveStraight(speed: Double, durationS: Double): JSONObject {
         val wheels = JSONObject()
         for (part in WheelMap.WHEELS) {
@@ -65,13 +70,11 @@ class DriveController(private val hubs: Map<String, HubConnector>) {
         val clampedSpeed = abs(speed).coerceIn(0.0, 1.0)
         val clampedDuration = durationS.coerceIn(0.0, 5.0)
         val wheels = JSONObject()
-        for (part in listOf("front_left_wheel", "rear_left_wheel")) {
-            val (connector, wiring) = connectorFor(part) ?: continue
-            wheels.put(part, connector.driveForTime(wiring.port, leftSign * clampedSpeed, clampedDuration, invert = wiring.invert))
+        connectorFor("left_wheel")?.let { (connector, wiring) ->
+            wheels.put("left_wheel", connector.driveForTime(wiring.port, leftSign * clampedSpeed, clampedDuration, invert = wiring.invert))
         }
-        for (part in listOf("front_right_wheel", "rear_right_wheel")) {
-            val (connector, wiring) = connectorFor(part) ?: continue
-            wheels.put(part, connector.driveForTime(wiring.port, -leftSign * clampedSpeed, clampedDuration, invert = wiring.invert))
+        connectorFor("right_wheel")?.let { (connector, wiring) ->
+            wheels.put("right_wheel", connector.driveForTime(wiring.port, -leftSign * clampedSpeed, clampedDuration, invert = wiring.invert))
         }
         return JSONObject().put("status", "ok").put("wheels", wheels)
     }
@@ -79,13 +82,13 @@ class DriveController(private val hubs: Map<String, HubConnector>) {
     suspend fun turnLeft(speed: Double, durationS: Double): JSONObject = pivotTurn(leftSign = -1, speed, durationS)
     suspend fun turnRight(speed: Double, durationS: Double): JSONObject = pivotTurn(leftSign = 1, speed, durationS)
 
-    /** direction: "up" (-45), "down" (+45), or "center"/"forward" (0) --
+    /** direction: "up" (-45), "down" (+45), or "center"/"forward" (-7) --
      * anything else is an error, not a silent fallback to center. */
     suspend fun tiltHead(direction: String): JSONObject {
         val target = when (direction.lowercase()) {
             "up" -> -45.0
             "down" -> 45.0
-            "center", "forward" -> 0.0
+            "center", "forward" -> -7.0
             else -> return JSONObject().put("status", "error")
                 .put("message", "unknown tilt direction '$direction', expected up/down/center")
         }
