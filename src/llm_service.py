@@ -87,15 +87,22 @@ def _print_tick(result: TickRunResult, dispatch_result: Optional[DispatchResult]
         print(f"[TICK OK] used_autofix={result.tick.used_autofix}")
         print(f"action: {result.tick.action}")
         if dispatch_result is not None:
+            if not dispatch_result.face_ok:
+                print(f"[DISPATCH FAILED] face: {dispatch_result.face_error}")
+
             if dispatch_result.voice_skipped_silent:
-                print("[DISPATCHED] face sent, speech skipped (model chose to stay silent)")
-            elif dispatch_result.ok:
-                print("[DISPATCHED] face + voice sent to phone")
+                print("[VOICE] skipped -- model chose to stay silent")
+            elif not dispatch_result.voice_ok:
+                print(f"[DISPATCH FAILED] voice: {dispatch_result.voice_error}")
             else:
-                if not dispatch_result.face_ok:
-                    print(f"[DISPATCH FAILED] face: {dispatch_result.face_error}")
-                if not dispatch_result.voice_ok:
-                    print(f"[DISPATCH FAILED] voice: {dispatch_result.voice_error}")
+                print("[VOICE] sent to phone")
+
+            if dispatch_result.drive_skipped_stationary:
+                print("[DRIVE] skipped -- stationary")
+            elif not dispatch_result.drive_ok:
+                print(f"[DISPATCH FAILED] drive: {dispatch_result.drive_error}")
+            else:
+                print("[DRIVE] sent to phone")
     else:
         print(f"[TICK REJECTED] errors: {result.tick.errors}")
         print(f"raw: {result.tick.raw!r}")

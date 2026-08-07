@@ -102,13 +102,20 @@ async def run_forever(
                 if spoke_something_new:
                     await wait_until_speech_done(senses_client, gui_base_url)
 
-                # Driving isn't dispatched to the phone yet -- still out
-                # of scope per the roadmap -- but pacing ticks around
-                # the duration the MODEL ITSELF chose is free
-                # correctness to build in now. When driving is wired up
-                # for real, this loop won't need revisiting: it already
-                # can't generate a fresh instruction before the last one
-                # would have finished playing out.
+                # Driving is now dispatched for real (dispatch.py's
+                # /api/drive call). This sleep is deliberately kept
+                # even though the phone MIGHT already block that HTTP
+                # call until the physical drive completes -- I don't
+                # have a way to confirm that from here without real
+                # hardware, and the two possible outcomes aren't
+                # symmetric: if the phone already blocks, this sleep
+                # just adds a harmless extra pause; if it doesn't, and
+                # this sleep were removed, the next tick could send a
+                # contradictory drive command while the robot is still
+                # physically mid-motion. If you can confirm on real
+                # hardware that the phone's /drive response already
+                # doesn't return until motion completes, this sleep can
+                # be safely dropped.
                 drive = result.tick.action.drive
                 if drive.direction != "STATIONARY" and drive.duration > 0:
                     await asyncio.sleep(drive.duration)

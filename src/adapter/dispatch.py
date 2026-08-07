@@ -1,25 +1,25 @@
 """
-dispatch.py -- sends a validated Action's expression and speech to the
-phone, via gui/server.py's EXISTING /api/face/set and /api/voice/say
-proxies (which themselves forward to ProbeService.kt on the phone).
-No new phone-side code needed -- these endpoints were already built
-and working from the manual dashboard controls.
+dispatch.py -- sends a validated Action's expression, speech, and now
+drive command to the phone, via gui/server.py's EXISTING /api/face/set,
+/api/voice/say, and /api/drive proxies (which themselves forward to
+ProbeService.kt on the phone). No new phone-side code needed -- all
+three endpoints were already built and working from the manual
+dashboard controls; /api/drive's own docstring literally says it's
+"the actual command surface the future LLM layer will call."
 
 Deliberately goes through gui/server.py rather than hitting the phone
 directly, same reasoning as senses.py: gui/server.py is the only thing
 that should know the phone's IP or hold connection state. Every
-LLM-side call, inbound (senses) or outbound (face/voice), goes through
-it, not just one direction.
+LLM-side call, inbound (senses) or outbound (face/voice/drive), goes
+through it, not just one direction.
 
-Driving is NOT dispatched here -- explicitly still out of scope per
-the project roadmap (senses -> feedback -> driving/memory/face id, in
-that order). This module only ever sends next_expression and
-speech_out; action.drive is read and validated by the adapter layer
-but never acted on yet.
-
-speech_out == "" is the model's explicit "stay silent" choice, same
-convention as drive.direction=STATIONARY -- skips the /voice/say call
-entirely, no empty utterance sent.
+speech_out == "" is the model's explicit "stay silent" choice, and
+drive.direction == "STATIONARY" is the explicit "don't move" choice --
+same convention, and deliberately independent of each other: the robot
+can stay silent while driving, or speak while stationary. Skipping one
+must never skip the other (an earlier version of this file had that
+exact bug -- the silent-speech path returned early, before the drive
+dispatch even ran).
 
 IMPORTANT, learned the hard way: this module does NOT pre-check
 whether the phone is still speaking before sending new speech.
@@ -34,8 +34,8 @@ TTS engine has a known quirk where a FLUSHED utterance doesn't always
 fire its completion callback, which can leave "speaking" stuck true in
 VoiceController's tracking set forever. That pre-check trusted that
 flag completely and silenced all future speech once it got stuck.
-Pacing WHEN new speech gets generated (so the model doesn't even try to
-say something new until the last thing finished) belongs in
+Pacing WHEN new speech/driving gets generated (so the model doesn't
+even try something new until the last thing finished) belongs in
 tick_loop.py, via wait_until_speech_done below -- that's a timing
 concern for the caller, not a "should I allow this" gate here.
 """
@@ -48,6 +48,19 @@ import httpx
 
 from .validate import Action
 
+# Maps schema.py's DRIVE_DIRECTIONS to gui/server.py's DRIVE_COMMANDS
+# vocabulary -- these are deliberately different names on each side
+# (FORWARD vs go_forward, etc.) since schema.py's enum was designed
+# around the original robot-facing spec, while DRIVE_COMMANDS matches
+# ProbeService.kt's actual /drive endpoint. STATIONARY has no entry
+# here on purpose -- it's not a command to send, it's "send nothing."
+_DRIVE_COMMAND_MAP = {
+    "FORWARD": "go_forward",
+    "BACKWARDS": "go_back",
+    "TURN_LEFT": "turn_left",
+    "TURN_RIGHT": "turn_right",
+}
+
 
 @dataclass(frozen=True)
 class DispatchResult:
@@ -56,10 +69,13 @@ class DispatchResult:
     voice_ok: bool
     voice_error: str | None
     voice_skipped_silent: bool = False
+    drive_ok: bool = True
+    drive_error: str | None = None
+    drive_skipped_stationary: bool = False
 
     @property
     def ok(self) -> bool:
-        return self.face_ok and self.voice_ok
+        return self.face_ok and self.voice_ok and self.drive_ok
 
 
 async def dispatch_action(
@@ -67,35 +83,45 @@ async def dispatch_action(
     gui_base_url: str,
     client: httpx.AsyncClient,
 ) -> DispatchResult:
-    """POSTs the action's expression and speech to the phone via
-    gui/server.py. Failures are caught and reported, never raised --
-    a dispatch failure (phone briefly unreachable, one dropped request)
-    shouldn't take down the tick loop; the next tick tries again with
-    fresh state regardless, same "skip and move on" philosophy as
-    process_tick's own failure handling.
+    """POSTs the action's expression, speech, and drive command to the
+    phone via gui/server.py. Failures are caught and reported, never
+    raised -- a dispatch failure (phone briefly unreachable, one
+    dropped request) shouldn't take down the tick loop; the next tick
+    tries again with fresh state regardless, same "skip and move on"
+    philosophy as process_tick's own failure handling.
 
-    Speech is always attempted (unless explicitly silent) -- no
-    still-speaking pre-check. See module docstring for why.
+    Face, voice, and drive are three INDEPENDENT dispatches -- skipping
+    one (silent speech, stationary drive) never skips another.
     """
     face_ok, face_error = await _post(
         client, f"{gui_base_url}/api/face/set", {"expression": action.next_expression}
     )
 
+    voice_ok, voice_error, voice_skipped_silent = True, None, False
     if not action.speech_out:
         # Explicit "stay silent" -- validate.py already stripped
         # whitespace-only strings down to "", so this catches both the
         # model literally emitting "" and it emitting "   ".
-        return DispatchResult(
-            face_ok=face_ok, face_error=face_error,
-            voice_ok=True, voice_error=None, voice_skipped_silent=True,
+        voice_skipped_silent = True
+    else:
+        voice_ok, voice_error = await _post(
+            client, f"{gui_base_url}/api/voice/say", {"text": action.speech_out, "interrupt": True}
         )
 
-    voice_ok, voice_error = await _post(
-        client, f"{gui_base_url}/api/voice/say", {"text": action.speech_out, "interrupt": True}
-    )
+    drive_ok, drive_error, drive_skipped_stationary = True, None, False
+    if action.drive.direction == "STATIONARY":
+        drive_skipped_stationary = True
+    else:
+        command = _DRIVE_COMMAND_MAP[action.drive.direction]
+        drive_ok, drive_error = await _post(
+            client, f"{gui_base_url}/api/drive",
+            {"command": command, "speed": action.drive.speed, "duration_s": action.drive.duration},
+        )
+
     return DispatchResult(
         face_ok=face_ok, face_error=face_error,
-        voice_ok=voice_ok, voice_error=voice_error,
+        voice_ok=voice_ok, voice_error=voice_error, voice_skipped_silent=voice_skipped_silent,
+        drive_ok=drive_ok, drive_error=drive_error, drive_skipped_stationary=drive_skipped_stationary,
     )
 
 
@@ -150,7 +176,7 @@ async def wait_until_speech_done(
 
 async def _post(client: httpx.AsyncClient, url: str, json_body: dict) -> tuple[bool, str | None]:
     try:
-        resp = await client.post(url, json=json_body, timeout=10.0)
+        resp = await client.post(url, json=json_body, timeout=15.0)
         data = resp.json()
         # gui/server.py's proxies return {"status": "error", ...} with a
         # 4xx/5xx status for known failure cases (e.g. "not connected to
