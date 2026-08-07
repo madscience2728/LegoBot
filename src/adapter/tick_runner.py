@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 from .docker_gemma4_adapter import DockerGemma4Adapter
 from .loop import TickResult, process_tick
-from .prompt import build_system_prompt
+from .prompt import build_priming_messages, build_system_prompt
 from .senses import SensesSnapshot
 
 
@@ -71,8 +71,9 @@ def _build_user_content(state: dict, senses: SensesSnapshot | None) -> str | lis
 async def run_tick(
     adapter: DockerGemma4Adapter,
     state: dict,
-    persona_preamble: str = "",
+    persona_preamble: str | None = None,
     senses: SensesSnapshot | None = None,
+    include_priming: bool = True,
 ) -> TickRunResult:
     """Runs one full tick: state dict (+ optionally sight/hearing) in,
     validated (or rejected) Action out, via a real call to the model.
@@ -85,15 +86,29 @@ async def run_tick(
             head tilt, memories, sensory placeholders, etc. Built by
             the caller each tick; this function doesn't know or care
             where it came from.
-        persona_preamble: optional personality/identity text prepended
-            to the system prompt, ahead of the OUTPUT FORMAT spec.
-            Left blank by default since that's the brain-sim's concern,
-            not this file's.
+        persona_preamble: personality/identity text prepended to the
+            system prompt, ahead of the OUTPUT FORMAT spec. None (the
+            default) means "use build_system_prompt's own default" --
+            prompt.py's DEFAULT_PERSONA -- rather than silently
+            replacing it with nothing. Pass "" explicitly if you
+            genuinely want no persona at all.
         senses: optional SensesSnapshot from senses.fetch_latest_senses.
             When provided and it actually has vision and/or audio, the
             user message becomes a multimodal content list instead of
             a plain JSON string -- see _build_user_content's docstring
             for the vision-confirmed / audio-unverified distinction.
+        include_priming: when True (default), prepends prompt.py's
+            build_priming_messages() -- a short scripted exchange
+            establishing HOW LegoBot behaves (not an assistant, silence
+            is fine, no boot-log narration) -- between the system
+            prompt and the real per-tick user turn. Included on every
+            tick, not just the first, since there's no persistent
+            conversation history yet (memory is still out of scope per
+            the roadmap) -- each tick is a fresh call to the model, so
+            the norms need re-establishing every time until real memory
+            exists. Set False to skip it (e.g. cheaper/faster testing
+            of the mechanical JSON contract alone, or once real
+            conversation history makes the priming redundant).
 
     Returns:
         TickRunResult wrapping the TickResult from process_tick, plus
@@ -104,11 +119,11 @@ async def run_tick(
         reject as unparseable, same skip-the-tick behavior as any other
         bad output. No special-casing needed here for that case.
     """
-    system_prompt = build_system_prompt(persona_preamble)
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": _build_user_content(state, senses)},
-    ]
+    system_prompt = build_system_prompt() if persona_preamble is None else build_system_prompt(persona_preamble)
+    messages = [{"role": "system", "content": system_prompt}]
+    if include_priming:
+        messages.extend(build_priming_messages())
+    messages.append({"role": "user", "content": _build_user_content(state, senses)})
 
     node_result = await adapter.complete_async(messages)
     tick_result = process_tick(node_result.content)
