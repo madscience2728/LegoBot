@@ -26,6 +26,21 @@
     </form>
   </header>
 
+  <div class="llm-banner" id="llmBanner" style="display:none;">
+    <div class="llm-banner-main">
+      <span class="dot" id="llmDot"></span>
+      <div class="llm-banner-text">
+        <div class="llm-banner-title" id="llmBannerTitle">LLM backend not connected</div>
+        <div class="llm-banner-message" id="llmBannerMessage"></div>
+      </div>
+    </div>
+    <div class="llm-banner-cmd" id="llmBannerCmdWrap" style="display:none;">
+      <label>Run this to start it:</label>
+      <pre id="llmBannerCmd"></pre>
+    </div>
+    <button type="button" class="btn-retry" id="llmRetryBtn">Try again</button>
+  </div>
+
   <div class="grid">
 
     <!-- CAMERA -->
@@ -281,6 +296,10 @@ const $ = (id) => document.getElementById(id);
 
 const els = {
   connDot: $('connDot'), connSub: $('connSub'),
+  llmBanner: $('llmBanner'), llmDot: $('llmDot'),
+  llmBannerTitle: $('llmBannerTitle'), llmBannerMessage: $('llmBannerMessage'),
+  llmBannerCmdWrap: $('llmBannerCmdWrap'), llmBannerCmd: $('llmBannerCmd'),
+  llmRetryBtn: $('llmRetryBtn'),
   camBadge: $('camBadge'), cameraFrame: $('cameraFrame'), cameraImg: $('cameraImg'),
   camFps: $('camFps'), camLatency: $('camLatency'), camSize: $('camSize'),
   micBadge: $('micBadge'), meterFill: $('meterFill'), micDbfs: $('micDbfs'), micLatency: $('micLatency'),
@@ -337,6 +356,34 @@ function fmtAge(ms) {
 
 function handleMessage(msg) {
   switch (msg.type) {
+    case 'llm_status': {
+      if (msg.status === 'connected') {
+        els.llmBanner.style.display = 'none';
+      } else if (msg.status === 'connecting') {
+        els.llmBanner.style.display = 'flex';
+        els.llmDot.className = 'dot warn';
+        els.llmBannerTitle.textContent = 'Connecting to LLM backend…';
+        els.llmBannerMessage.textContent = '';
+        els.llmBannerCmdWrap.style.display = 'none';
+        els.llmRetryBtn.style.display = 'none';
+      } else if (msg.status === 'error') {
+        els.llmBanner.style.display = 'flex';
+        els.llmDot.className = 'dot off';
+        els.llmBannerTitle.textContent = 'LLM backend not connected';
+        els.llmBannerMessage.textContent = msg.message || '';
+        if (msg.docker_command) {
+          els.llmBannerCmdWrap.style.display = 'block';
+          els.llmBannerCmd.textContent = msg.docker_command;
+        } else {
+          els.llmBannerCmdWrap.style.display = 'none';
+        }
+        els.llmRetryBtn.style.display = 'inline-block';
+        els.llmRetryBtn.disabled = false;
+        els.llmRetryBtn.textContent = 'Try again';
+      }
+      break;
+    }
+
     case 'conn_status': {
       const sub = msg.phone_ip ? `phone ${msg.phone_ip}` : 'not connected';
       els.connSub.textContent = msg.error ? `${sub} — ${msg.error}` : sub;
@@ -762,6 +809,22 @@ $('disconnectBtn').addEventListener('click', async () => {
   els.cameraFrame.classList.remove('has-frame');
   setBadge(els.camBadge, 'no signal', '');
   setBadge(els.micBadge, 'no signal', '');
+});
+
+els.llmRetryBtn.addEventListener('click', async () => {
+  els.llmRetryBtn.disabled = true;
+  els.llmRetryBtn.textContent = 'Retrying…';
+  try {
+    await fetch('/api/llm/retry', { method: 'POST' });
+    // No optimistic UI change beyond this -- the actual 'connecting'
+    // then 'connected'/'error' states arrive over the websocket as
+    // run_llm_service() reports them, same source of truth as every
+    // other status in this dashboard.
+  } catch (err) {
+    els.llmRetryBtn.disabled = false;
+    els.llmRetryBtn.textContent = 'Try again';
+    alert(`retry request failed: ${err}`);
+  }
 });
 
 document.querySelectorAll('.hub-connect-btn').forEach(btn => {

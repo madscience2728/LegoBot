@@ -49,6 +49,21 @@ _config = load_config()
 MAX_PARALLEL_PREDICTIONS = _config['lm_config']['max_parallel_predictions']
 
 
+class DockerServerUnavailable(Exception):
+    """Raised by load() when the Docker llama.cpp server isn't reachable.
+    Deliberately a plain catchable exception now, NOT SystemExit -- this
+    adapter is used both by one-shot standalone scripts (where exiting
+    the process is reasonable) and by the always-running GUI+LLM service
+    (main.py, no flag needed), where a missing Docker container should
+    surface as a retryable UI state, not take the whole process down.
+    Carries the exact docker_command needed to fix it, so callers don't
+    need to reconstruct it themselves.
+    """
+    def __init__(self, message: str, docker_command: str):
+        super().__init__(message)
+        self.docker_command = docker_command
+
+
 class DockerGemma4Adapter:
     def __init__(self, enable_thinking=False):
         """
@@ -146,7 +161,14 @@ class DockerGemma4Adapter:
         return ' '.join(cmd_parts)
 
     async def load(self):
-        """Async initialization - performs health check"""
+        """Async initialization - performs health check.
+
+        Raises DockerServerUnavailable (not SystemExit) if the server
+        isn't reachable -- see that class's docstring for why. Console
+        output (the docker run command) is still printed either way,
+        since that's useful whether the caller is a one-shot script or
+        a supervised retry loop.
+        """
         print("Testing connection to Docker Gemma 4 server...")
         try:
             response = await self.client.get(f"{self.base_url}/v1/models")
@@ -154,13 +176,14 @@ class DockerGemma4Adapter:
                 raise Exception(f"Expected status code 200, got {response.status_code}")
             print("[Docker Gemma 4 Adapter loaded successfully]")
         except Exception as e:
+            docker_command = self._assemble_docker_command()
             print(f"⚠️  Failed to connect to Docker Gemma 4 server: {e}")
             print("\n" + "=" * 80)
             print("Docker server is not running. Please start it with this command:")
             print("=" * 80)
-            print(f"\n{self._assemble_docker_command()}\n")
+            print(f"\n{docker_command}\n")
             print("=" * 80)
-            raise SystemExit("Docker server not running. Exiting gracefully.")
+            raise DockerServerUnavailable(str(e), docker_command) from e
 
     def complete_synchronous(self, messages):
         """Synchronous completion call"""

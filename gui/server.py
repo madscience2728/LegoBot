@@ -43,6 +43,18 @@ from pydantic import BaseModel, Field, field_validator
 from typing import Literal
 import uvicorn
 
+import sys
+from pathlib import Path as _Path
+# Guarantees gui/ itself is on sys.path before the bare `from segmenter
+# import ...` below, regardless of how this file was loaded: directly
+# (`python3 gui/server.py`, which already puts gui/ on sys.path on its
+# own) or as a package import (`from gui.server import ...` in main.py,
+# run from the project root -- which puts the ROOT on sys.path, not
+# gui/ itself, so the bare import would otherwise fail there).
+sys.path.insert(0, str(_Path(__file__).resolve().parent))
+
+from segmenter import Segmenter, pcm_to_wav_bytes
+
 # ---------------------------------------------------------------------------
 # Config -- matches the phone-side ports/paths in ProbeService.kt and
 # relay/MediaRelayServer.kt exactly. Don't change these unless the phone
@@ -175,11 +187,61 @@ class State:
         self.last_ble: Optional[dict] = None
         self.last_hub_status: Optional[dict] = None
         self.last_video_b64: Optional[str] = None
+        # Complete spoken utterances only, via VAD (see segmenter.py --
+        # ported from the old Pi project). Silence between utterances
+        # is never stored at all: last_utterance_wav stays whatever it
+        # was until webrtcvad detects a real utterance finishing.
+        # last_utterance_consumed tracks whether the tick loop has
+        # already picked this one up, so the same speech doesn't get
+        # sent to the model on every poll until someone speaks again.
+        self.segmenter = Segmenter(self._on_utterance)
+        self.last_utterance_wav: Optional[bytes] = None
+        self.last_utterance_ts: Optional[float] = None
+        self.last_utterance_consumed: bool = True
+        self.last_video_ts: Optional[float] = None
         self.video_timing = ChannelTiming()
         self.audio_timing = ChannelTiming()
         self.command_history: deque = deque(maxlen=50)
         self.tasks: list[asyncio.Task] = []
         self.clients: set[WebSocket] = set()
+        # LLM backend status -- set by src/llm_service.py's supervisor
+        # loop via set_llm_status(), consumed by the dashboard to show
+        # the "not connected" alert + retry button. "connecting" is the
+        # correct initial value: run_llm_service() reports this as its
+        # very first status, before this process has even attempted a
+        # health check yet.
+        self.llm_status: str = "connecting"
+        self.llm_error: Optional[str] = None
+        self.llm_docker_command: Optional[str] = None
+        # Set by POST /api/llm/retry (the dashboard's "Try again"
+        # button); run_llm_service() waits on this to skip its normal
+        # auto-retry delay and try again immediately.
+        self.llm_retry_event: asyncio.Event = asyncio.Event()
+
+    def _on_utterance(self, pcm_bytes: bytes):
+        self.last_utterance_wav = pcm_to_wav_bytes(pcm_bytes)
+        self.last_utterance_ts = time.time()
+        self.last_utterance_consumed = False
+
+    def set_llm_status(self, payload: dict) -> None:
+        """Callback passed to run_llm_service(on_status=...) -- updates
+        the fields above and broadcasts the change to every connected
+        browser tab. Called synchronously (not awaited) from the
+        supervisor loop, so it schedules the broadcast as a background
+        task rather than awaiting it directly.
+        """
+        self.llm_status = payload.get("status", "unknown")
+        self.llm_error = payload.get("message")
+        self.llm_docker_command = payload.get("docker_command")
+        asyncio.create_task(broadcast({"type": "llm_status", **payload}))
+
+    def llm_status_payload(self) -> dict:
+        return {
+            "type": "llm_status",
+            "status": self.llm_status,
+            "message": self.llm_error,
+            "docker_command": self.llm_docker_command,
+        }
 
     def status_payload(self) -> dict:
         return {
@@ -236,6 +298,7 @@ async def media_relay_loop(ip: str):
                         state.video_timing.record(latency_ms)
                         b64 = base64.b64encode(payload).decode("ascii")
                         state.last_video_b64 = b64
+                        state.last_video_ts = phone_ts
                         await broadcast({
                             "type": "video_frame",
                             "b64": b64,
@@ -246,6 +309,7 @@ async def media_relay_loop(ip: str):
 
                     elif msg_type == TYPE_AUDIO:
                         state.audio_timing.record(latency_ms)
+                        state.segmenter.process(payload)
                         level, dbfs = pcm16_level(payload)
                         nowm = time.monotonic()
                         if nowm - last_audio_broadcast >= 1.0 / AUDIO_BROADCAST_HZ:
@@ -259,14 +323,17 @@ async def media_relay_loop(ip: str):
                             })
 
         except asyncio.CancelledError:
+            state.segmenter.flush()
             raise
         except Exception as exc:
+            state.segmenter.flush()
             state.media_connected = False
             await broadcast({**state.status_payload(), "error": f"media link: {exc}"})
             await asyncio.sleep(3)
             continue
 
         # ws closed cleanly (e.g. phone stopped the service) -- retry
+        state.segmenter.flush()
         state.media_connected = False
         await broadcast(state.status_payload())
         await asyncio.sleep(3)
@@ -412,6 +479,51 @@ async def api_disconnect():
     await stop_connection()
     await broadcast(state.status_payload())
     return {"status": "disconnected"}
+
+
+@app.get("/api/llm/status")
+async def api_llm_status():
+    return state.llm_status_payload()
+
+
+@app.post("/api/llm/retry")
+async def api_llm_retry():
+    """Called by the dashboard's "Try again" button. Wakes up
+    run_llm_service()'s supervisor loop immediately instead of it
+    waiting out the normal auto-retry delay."""
+    state.llm_retry_event.set()
+    return {"status": "retry_requested"}
+
+
+@app.get("/api/senses/latest")
+async def api_senses_latest():
+    """Snapshot of the most recent camera frame and the most recent
+    COMPLETE spoken utterance (via VAD -- see segmenter.py), for the
+    LLM tick loop to poll each tick.
+
+    Audio is one-shot by design: once an utterance has been read here,
+    audio_wav_b64 goes back to null until a NEW utterance finishes.
+    That's deliberate -- without it, the same thing someone said once
+    would get resent to the model on every tick until they spoke
+    again, which is both wasteful and would look to the model like the
+    words were being repeated on a loop.
+    """
+    audio_wav_b64 = None
+    audio_seconds = 0.0
+    if state.last_utterance_wav is not None and not state.last_utterance_consumed:
+        audio_wav_b64 = base64.b64encode(state.last_utterance_wav).decode("ascii")
+        # WAV header is 44 bytes; rest is 16kHz mono PCM16, 2 bytes/sample.
+        audio_seconds = round(max(0, len(state.last_utterance_wav) - 44) / (16000 * 2), 2)
+        state.last_utterance_consumed = True
+
+    return {
+        "media_connected": state.media_connected,
+        "video_b64": state.last_video_b64,
+        "video_ts": state.last_video_ts,
+        "audio_wav_b64": audio_wav_b64,
+        "audio_ts": state.last_utterance_ts,
+        "audio_seconds": audio_seconds,
+    }
 
 
 @app.get("/api/status")
@@ -890,6 +1002,7 @@ async def ws_endpoint(ws: WebSocket):
     state.clients.add(ws)
     try:
         await ws.send_json(state.status_payload())
+        await ws.send_json(state.llm_status_payload())
         while True:
             # Browser doesn't need to send anything; just keep the socket
             # open and drop the connection if the client goes away.
@@ -904,6 +1017,19 @@ async def ws_endpoint(ws: WebSocket):
 
 def main():
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+async def serve_async():
+    """Async-native equivalent of main()'s uvicorn.run(), for running
+    the GUI server as one coroutine alongside another (the LLM tick
+    loop) inside a single asyncio.gather() -- see main.py's --llm flag.
+    uvicorn.run() creates and owns its own event loop internally, which
+    is exactly what you DON'T want when something else also needs to
+    run concurrently in the same process.
+    """
+    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
 
 
 if __name__ == "__main__":

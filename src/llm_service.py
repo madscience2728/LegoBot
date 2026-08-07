@@ -1,53 +1,66 @@
 """
-llm_service.py -- manual entry point for the LLM backend.
+llm_service.py -- the LLM backend supervisor.
 
-Standalone for now, started by hand:
+Run standalone by hand:
 
-    python3 llm_service.py
+    python3 src/llm_service.py
 
-Eventually main.py should grow a flag (e.g. --llm, alongside its
-existing --deploy) that runs this alongside the GUI instead of you
-needing to start it separately -- not wired up yet, on purpose, same
-reasoning main.py's own docstring gives for --deploy being separate
-from the GUI: prove the piece works standalone before folding it into
-the coordinated entry point.
+Or, normally, just:
+
+    python3 main.py
+
+-- main.py now always starts this alongside the GUI, in one process,
+no flag needed. See main.py's docstring for why one process instead of
+two separate ones.
 
 What this does:
-    1. Constructs a DockerGemma4Adapter and runs its health check
-       (adapter.load()). All the actual "is the server up, what do I do
-       if not" logic already lives in the adapter itself -- if the
-       Docker llama.cpp server isn't reachable at config.json's
-       lm_config.base_url, adapter.load() prints the exact `docker run`
-       command and raises SystemExit.
-    2. If healthy, runs ONE real test tick through run_tick() with a
-       hardcoded sample state, using your actual model -- not a fake
-       adapter like the sandbox test that proved run_tick's wiring.
-       Prints the raw model output, the validated Action (or the
-       rejection reason), and token counts.
+    run_llm_service() is a supervisor loop that NEVER crashes the
+    process on a Docker/model failure. If the Docker llama.cpp server
+    isn't reachable, it reports that (via the on_status callback, and
+    to the console either way) and waits -- either for
+    AUTO_RETRY_INTERVAL_S to pass, or for retry_event to be set
+    (main.py wires this to the GUI's "Try again" button via
+    POST /api/llm/retry) -- then tries again. Once connected, it runs
+    the repeating tick loop (tick_loop.run_forever) same as before.
 
-This is still a one-shot script, not an ongoing loop -- it proves the
-full chain works on your real hardware/model once, then exits. The
-ongoing tick loop (repeated ticks, feeding real sensor state instead
-of this hardcoded sample, streaming to the UI) is still not built.
+    This used to raise SystemExit straight out of adapter.load() on
+    failure, which took the whole process down -- including the GUI,
+    even though the GUI has nothing to do with whether Docker happens
+    to be running. That's been moved to a plain catchable exception
+    (DockerServerUnavailable, in docker_gemma4_adapter.py) specifically
+    so this loop can catch it and keep going instead.
 """
 import asyncio
 import sys
 from pathlib import Path
+from typing import Callable, Optional
 
 # Makes this runnable directly as `python3 src/llm_service.py` (which
 # puts src/ itself on sys.path, not the project root) as well as
 # `python3 -m src.llm_service` from the root (which already gets this
 # right on its own) -- without this, the absolute `from src.adapter...`
-# import below only works in the second case.
+# imports below only work in the second case.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.adapter.docker_gemma4_adapter import DockerGemma4Adapter
-from src.adapter.tick_runner import run_tick
+from src.adapter.docker_gemma4_adapter import DockerGemma4Adapter, DockerServerUnavailable
+from src.adapter.tick_loop import run_forever
+from src.adapter.tick_runner import TickRunResult
+
+# Where gui/server.py's FastAPI app is running -- same machine, so
+# localhost. Change this if you ever run the GUI server elsewhere.
+GUI_BASE_URL = "http://127.0.0.1:8000"
+
+TICK_INTERVAL_S = 3.0
+
+# How long to wait between automatic retry attempts if nobody clicks
+# "try again" -- so leaving it running with Docker off and then
+# starting Docker later still recovers on its own within this window.
+AUTO_RETRY_INTERVAL_S = 10.0
 
 # Hardcoded stand-in for real gathered state (memory system, position
-# tracking, etc. don't exist yet). Good enough to prove the model
-# actually receives the prompt correctly and responds in the right
-# shape -- swap this out once real state-gathering exists.
+# tracking, etc. don't exist yet -- deliberately out of scope until
+# senses + feedback are both proven). Good enough to prove the model
+# actually receives sight/hearing correctly each tick.
 _SAMPLE_STATE = {
     "name": "LegoBot",
     "current_expression": "neutral",
@@ -58,34 +71,119 @@ _SAMPLE_STATE = {
 }
 
 
-async def _check_and_tick():
-    print("== LLM service: checking Docker Gemma 4 backend ==")
-    adapter = DockerGemma4Adapter(enable_thinking=False)
-    await adapter.load()
-    print("[LLM service reachable and healthy]")
+def _build_state() -> dict:
+    # Function, not a constant, so a real memory/state system can
+    # replace just this one function later without touching the loop.
+    return dict(_SAMPLE_STATE)
 
+
+def _print_tick(result: TickRunResult) -> None:
     print()
-    print("== Running one real test tick ==")
-    result = await run_tick(adapter, _SAMPLE_STATE)
-
-    print(f"raw model output: {result.tick.raw!r}")
+    senses_str = f"vision={'yes' if result.had_vision else 'NO'} audio={'yes' if result.had_audio else 'NO'}"
+    print(f"senses this tick: {senses_str}")
     print(f"prompt_tokens={result.prompt_tokens} completion_tokens={result.completion_tokens}")
-
     if result.tick.ok:
         print(f"[TICK OK] used_autofix={result.tick.used_autofix}")
         print(f"action: {result.tick.action}")
     else:
         print(f"[TICK REJECTED] errors: {result.tick.errors}")
+        print(f"raw: {result.tick.raw!r}")
+
+
+async def _wait_before_retry(retry_event: Optional[asyncio.Event]) -> None:
+    """Waits for either AUTO_RETRY_INTERVAL_S to pass, or retry_event
+    to be set (the GUI's "Try again" button), whichever comes first.
+    Always clears the event afterward so a stale set() doesn't cause
+    an immediate second retry next time through.
+    """
+    if retry_event is None:
+        await asyncio.sleep(AUTO_RETRY_INTERVAL_S)
+        return
+    try:
+        await asyncio.wait_for(retry_event.wait(), timeout=AUTO_RETRY_INTERVAL_S)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        retry_event.clear()
+
+
+async def run_llm_service(
+    on_status: Optional[Callable[[dict], None]] = None,
+    retry_event: Optional[asyncio.Event] = None,
+) -> None:
+    """The supervisor loop. Runs forever (until cancelled) -- alternates
+    between "try to connect + run ticks" and "report the failure and
+    wait for a retry", never raising out of here on a Docker failure.
+
+    Args:
+        on_status: called with a dict every time connection status
+            changes -- {"status": "connecting"}, {"status": "connected"},
+            or {"status": "error", "message": ..., "docker_command": ...}.
+            main.py wires this to update gui/server.py's State and
+            broadcast it to the browser. None (standalone CLI use)
+            just skips this -- console printing below still happens
+            either way.
+        retry_event: an asyncio.Event the caller can .set() to trigger
+            an immediate retry instead of waiting out
+            AUTO_RETRY_INTERVAL_S. main.py wires this to the GUI's
+            "Try again" button. None (standalone CLI use) means only
+            automatic retries happen -- there's no button to wire in a
+            plain terminal.
+    """
+    def _report(status: dict):
+        if on_status is not None:
+            on_status(status)
+
+    while True:
+        print("== LLM service: checking Docker Gemma 4 backend ==")
+        _report({"status": "connecting"})
+
+        adapter = DockerGemma4Adapter(enable_thinking=False)
+        try:
+            await adapter.load()
+        except DockerServerUnavailable as e:
+            _report({
+                "status": "error",
+                "message": str(e),
+                "docker_command": e.docker_command,
+            })
+            print(f"[LLM service] not connected -- retrying in up to {AUTO_RETRY_INTERVAL_S:.0f}s "
+                  f"(or immediately if retried from the GUI)")
+            await _wait_before_retry(retry_event)
+            continue
+
+        print("[LLM service reachable and healthy]")
+        _report({"status": "connected"})
+
+        print()
+        print(f"== Starting repeating tick loop (every {TICK_INTERVAL_S}s) ==")
+        print(f"Pulling senses from {GUI_BASE_URL}")
+
+        # run_forever() only returns if cancelled (Ctrl+C / process
+        # shutdown) -- there's no "Docker died mid-loop" recovery here
+        # yet, since complete_async already catches httpx errors itself
+        # and returns an empty result rather than raising. A future
+        # improvement could detect a long run of empty results and loop
+        # back to a fresh health check; out of scope for this change.
+        await run_forever(
+            adapter,
+            GUI_BASE_URL,
+            _build_state,
+            interval_s=TICK_INTERVAL_S,
+            on_tick=_print_tick,
+        )
+        return  # pragma: no cover -- only reached if run_forever ever returns normally
 
 
 def main():
+    """Standalone entry point: `python3 src/llm_service.py`. Same
+    supervisor loop as the GUI-embedded version, just with no status
+    callback (prints to console instead) and no retry button (only
+    the automatic retry timer applies)."""
     try:
-        asyncio.run(_check_and_tick())
-    except SystemExit as e:
-        # adapter.load() already printed the docker run command and
-        # raised SystemExit itself -- just propagate a clean process
-        # exit here rather than adding a second, redundant message.
-        sys.exit(e.code if isinstance(e.code, int) else 1)
+        asyncio.run(run_llm_service())
+    except KeyboardInterrupt:
+        print("\n[LLM service stopped]")
 
 
 if __name__ == "__main__":
