@@ -1,0 +1,5 @@
+{
+  "model_dir": "C:\\Users\\death\\OneDrive\\Documents\\C4 Website\\Github\\Ezra in the Basement",
+  "model_file": "gemma-4-12B-it-QAT-Q4_0.gguf",
+  "mmproj_file": "mmproj-gemma-4-12B-it-QAT-BF16.gguf"
+}

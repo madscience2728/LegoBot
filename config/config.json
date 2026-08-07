@@ -1,0 +1,16 @@
+{
+  "lm_config": {
+    "base_url": "http://127.0.0.1:42069",
+    "tokenizer_endpoint": "http://localhost:42069/tokenize",
+    "httpx_timeout": 600,
+    "model_name": "gemma-4-12B-it-QAT-Q4_0.gguf",
+    "mmproj": "mmproj-gemma-4-12B-it-QAT-BF16.gguf",
+    "context_window": 196608,
+    "max_parallel_predictions": 1,
+    "max_output_tokens": 8192,
+    "safety_buffer": 32768,
+    "temperature": 1.0,
+    "repeat_penalty": 1.1,
+    "repeat_last_n": 128
+  }
+}
